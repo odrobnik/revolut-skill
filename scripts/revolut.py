@@ -1,0 +1,1567 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+"""Revolut automation + statement importer.
+
+This script provides two feature sets:
+
+1) Web automation (Playwright)
+   - login: QR-code login and save storage state
+   - logout: delete saved storage state
+   - accounts: fetch wallet accounts via Revolut Web API
+   - transactions: fetch latest transactions via Revolut Web API
+
+2) Statement import (CSV/PDF)
+   - import accounts
+   - import transactions
+
+The statement importer is the original functionality of this skill.
+"""
+
+import sys
+
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+import argparse
+import csv
+import json
+import os
+import re
+import subprocess
+import time
+import random
+from dataclasses import dataclass
+from datetime import datetime, date, timezone
+from pathlib import Path
+from typing import Any
+
+
+# Allow `--help` without requiring Playwright.
+if "-h" in sys.argv or "--help" in sys.argv:
+    sync_playwright = None  # type: ignore
+    PlaywrightTimeout = Exception  # type: ignore
+else:
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+    except Exception:
+        sync_playwright = None  # type: ignore
+        PlaywrightTimeout = Exception  # type: ignore
+
+
+SWIFTTEXT_BIN = Path("/Users/oliver/Developer/SwiftText/.build/arm64-apple-macosx/debug/swifttext")
+WORKSPACE_DIR = Path(os.environ.get("MOLTBOT_WORKSPACE", "/Users/oliver/clawd")).expanduser().resolve()
+
+# Ephemeral outputs (OCR markdown + default JSON output dir) go to /tmp by default.
+# Override with MOLTBOT_TMP if you want a different temp root.
+_TMP_ROOT = Path(os.environ.get("MOLTBOT_TMP", "/tmp")).expanduser().resolve()
+TMP_DIR = _TMP_ROOT / "moltbot" / "revolut"
+
+DEFAULT_STATE_FILE = WORKSPACE_DIR / "revolut_state.json"
+
+REVOLUT_BASE_URL = "https://app.revolut.com"
+REVOLUT_HOME_URL = f"{REVOLUT_BASE_URL}/home"
+REVOLUT_START_URL = f"{REVOLUT_BASE_URL}/start"
+INVEST_HOME_URL = "https://invest.revolut.com/portfolio/overview/all"
+
+# A reasonably "real" UA helps a bit with bot checks.
+DEFAULT_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
+)
+
+
+# ------------------------- shared utils -------------------------
+
+def _now_iso_local() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    _ensure_dir(path.parent)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _parse_iso_date(s: str) -> str:
+    return datetime.strptime(s, "%Y-%m-%d").date().isoformat()
+
+
+def _slug(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or "other"
+
+
+def _require_playwright() -> None:
+    if sync_playwright is None:
+        print("ERROR: playwright not installed. Run: pipx install playwright && playwright install chromium", file=sys.stderr)
+        raise SystemExit(1)
+
+
+# ------------------------- Revolut web (Playwright) -------------------------
+
+def _state_file_from_args(args) -> Path:
+    val = getattr(args, "state", None)
+    if val:
+        return Path(val).expanduser().resolve()
+    env = os.environ.get("REVOLUT_STATE")
+    if env:
+        return Path(env).expanduser().resolve()
+    return DEFAULT_STATE_FILE
+
+
+def _looks_like_passcode_screen(text: str) -> bool:
+    t = (text or "").lower()
+    return "enter passcode" in t or "forgot your passcode" in t
+
+
+def _fetch_via_interception(page, url_pattern: str, timeout_ms: int = 30000) -> dict | None:
+    """Capture JSON response matching url_pattern by reloading/navigating."""
+    captured = []
+    
+    def handle_response(response):
+        if url_pattern in response.url and response.status == 200:
+            try:
+                captured.append(response.json())
+            except: pass
+            
+    page.on("response", handle_response)
+    
+    # Trigger data load
+    try:
+        # Reloading usually triggers the main fetch
+        page.reload(wait_until="networkidle", timeout=timeout_ms)
+    except:
+        pass
+        
+    if captured:
+        return captured[0] # Return first match
+    return None
+
+
+def _extract_amount(value) -> float | None:
+    if value is None: return None
+    
+    # If direct number, check heuristic?
+    # Usually Revolut web API returns objects. If it returns a flat number, it might be units or cents.
+    # But let's handle the dict case first which is the common one.
+    
+    if isinstance(value, dict):
+        # Case 1: value + precision (e.g. {value: 1234, precision: 2} -> 12.34)
+        if isinstance(value.get("value"), (int, float)) and isinstance(value.get("precision"), int):
+            return float(value["value"]) / (10 ** int(value["precision"]))
+            
+        # Case 2: amount (usually cents) + currency
+        # "amount" might be int (1234) or str ("1234").
+        raw_amt = value.get("amount")
+        if raw_amt is not None:
+            try:
+                amt = float(raw_amt)
+            except:
+                return None
+                
+            # Check for currency indicator to confirm it's a money object
+            has_currency = False
+            for k in ("currency", "ccy", "currencyCode"):
+                if isinstance(value.get(k), str):
+                    has_currency = True
+                    break
+            
+            # Heuristic: If it has currency and looks like an integer, treat as cents.
+            # Revolut Web API almost always sends cents as integers (or strings of integers).
+            if has_currency:
+                # If it's an integer (1000.0 or 1000), divide by 100.
+                if amt.is_integer():
+                    return amt / 100.0
+                # If it's a float with decimals (10.50), it's likely already units.
+                return amt
+                
+            return amt
+
+    # Fallback for direct numbers or strings
+    if isinstance(value, int):
+        # Revolut API typically sends amounts in minor units (cents) as integers.
+        # e.g. 100 -> 1.00, 378899 -> 3788.99
+        return float(value) / 100.0
+        
+    if isinstance(value, float):
+        # If it's a float, it's ambiguous.
+        # But usually raw JSON has ints for cents.
+        # If json.load parsed it as float, it had a decimal point?
+        # If it had decimal point, assume units.
+        return value
+        
+    if isinstance(value, str):
+        try: return float(value.replace(" ", "").replace(",", "."))
+        except: return None
+
+    return None
+
+
+def _extract_currency(value) -> str | None:
+    if isinstance(value, dict):
+        for k in ("currency", "ccy"):
+            v = value.get(k)
+            if isinstance(v, str) and v.strip(): return v.strip().upper()
+    return None
+
+
+def _to_date_iso(value) -> str | None:
+    if value is None: return None
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 1e12: ts = ts / 1000.0
+        try: return datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
+        except: return None
+    return None
+
+
+def canonicalize_revolut_accounts(payload) -> list[dict]:
+    wallets: list[dict] = []
+    if isinstance(payload, list):
+        wallets = [w for w in payload if isinstance(w, dict)]
+    elif isinstance(payload, dict):
+        for key in ("wallets", "data", "items", "PERSONAL"): # Added PERSONAL/POCKETS handling
+            v = payload.get(key)
+            if isinstance(v, list):
+                wallets = [w for w in v if isinstance(w, dict)]
+                break
+        else:
+            wallets = [payload]
+
+    out: list[dict] = []
+    
+    # Handle nested pockets (PERSONAL -> pockets)
+    expanded_wallets = []
+    for w in wallets:
+        if "pockets" in w and isinstance(w["pockets"], list):
+            expanded_wallets.extend(w["pockets"])
+        else:
+            expanded_wallets.append(w)
+            
+    for w in expanded_wallets:
+        wid = w.get("id") or w.get("walletId") or w.get("uuid")
+        wid_s = str(wid) if wid is not None else ""
+
+        ccy = (w.get("currency") or w.get("ccy") or "").strip().upper() or _extract_currency(w.get("balance")) or ""
+        name = (
+            w.get("name")
+            or w.get("displayName")
+            or w.get("title")
+            or (f"Revolut Wallet ({ccy})" if ccy else "Revolut Wallet")
+        )
+
+        iban = None
+        for k in ("iban", "ibanFormatted"):
+            if isinstance(w.get(k), str) and w.get(k).strip():
+                iban = w.get(k).strip()
+                break
+
+        # Note: balance can be numeric 0 which is falsy, so we must not use `or` chaining here.
+        bal_src = None
+        if "balance" in w:
+            bal_src = w.get("balance")
+        elif "balances" in w:
+            bal_src = w.get("balances")
+        elif "amount" in w:
+            bal_src = w.get("amount")
+        bal_amt = _extract_amount(bal_src)
+
+        acct: dict = {
+            "id": wid_s or (ccy or name),
+            "type": "checking",
+            "name": str(name),
+            "currency": ccy or "EUR",
+        }
+
+        if iban:
+            acct["iban"] = iban
+
+        balances: dict = {}
+        if bal_amt is not None:
+            balances["booked"] = {"amount": bal_amt, "currency": acct["currency"]}
+            balances["available"] = {"amount": bal_amt, "currency": acct["currency"]}
+        if balances:
+            acct["balances"] = balances
+
+        out.append(acct)
+
+    out.sort(key=lambda a: ((a.get("currency") or ""), (a.get("name") or "")))
+    return out
+
+
+def _canonical_category_from_revolut_type(type_str: str) -> str:
+    t = (type_str or "").strip().lower()
+    if "card" in t: return "card_payment"
+    if "transfer" in t: return "transfer"
+    if "exchange" in t or "fx" in t: return "exchange"
+    return _slug(type_str)
+
+
+    # Filter by account ID if provided
+    if account_id:
+        filtered = []
+        for t in out:
+            # We need to access the raw transaction structure to check account.id?
+            # canonicalize_revolut_transactions takes raw payload and returns simplified dicts.
+            # But wait, simplified dict doesn't keep account.id!
+            # We need to filter *during* canonicalization or *before*.
+            pass 
+            
+        # Let's adjust canonicalize_revolut_transactions to accept filter_account_id
+        # OR: canonicalize_revolut_transactions could return the account ID in the simplified dict?
+        # Current simplified dict:
+        # { status, bookingDate, amount: {amount, currency}, category, description }
+        # It doesn't have account ID.
+        
+        # We should filter raw_txs BEFORE canonicalization.
+        pass
+
+def canonicalize_revolut_transactions(payload, filter_account_id: str | None = None) -> list[dict]:
+    txs: list[dict] = []
+    if isinstance(payload, list):
+        txs = [t for t in payload if isinstance(t, dict)]
+    elif isinstance(payload, dict):
+        for key in ("transactions", "data", "items"):
+            v = payload.get(key)
+            if isinstance(v, list):
+                txs = [t for t in v if isinstance(t, dict)]
+                break
+        else:
+            txs = [payload]
+
+    out: list[dict] = []
+    for t in txs:
+        # Filter by account.id if requested
+        if filter_account_id:
+            # Check t["account"]["id"]
+            acc = t.get("account") or {}
+            if acc.get("id") != filter_account_id:
+                # Also check pocketId just in case
+                if acc.get("pocketId") != filter_account_id:
+                    continue
+
+        state = (t.get("state") or t.get("status") or "").upper()
+        if state in ("COMPLETED", "BOOKED", "DONE"):
+            status = "booked"
+        elif state in ("DECLINED", "FAILED", "REJECTED", "CANCELLED"):
+            status = "rejected"
+        else:
+            status = "pending"
+
+        d = (_to_date_iso(t.get("completedAt")) or _to_date_iso(t.get("startedDate")))
+        if not d: continue
+
+        amt_obj = t.get("amount") or t.get("money") or t.get("balanceChange")
+        amt = _extract_amount(amt_obj)
+        ccy = ((t.get("currency") or "").strip().upper() or "EUR")
+        if amt is None: continue
+
+        desc = (t.get("description") or t.get("title") or (t.get("merchant") or {}).get("name") or "")
+        reason = t.get("reason")
+        
+        tx: dict = {
+            "status": status,
+            "bookingDate": d,
+            "valueDate": d,
+            "amount": {"amount": float(amt), "currency": ccy},
+            "category": {"code": _canonical_category_from_revolut_type(t.get("type") or "")},
+            "description": desc or None
+        }
+        if reason:
+            tx["rejectionReason"] = _slug(str(reason)).replace("_", " ").capitalize() # "insufficient_balance" -> "Insufficient balance"
+        out.append(tx)
+    return out
+
+
+def canonicalize_revolut_portfolio(payload, tickers_by_ref: dict[str, dict] | None = None) -> dict:
+    """Return banker-style portfolio positions.
+
+    If tickers_by_ref is provided, we enrich positions with:
+      - marketValue
+      - performance.absolute
+      - performance.percent
+    """
+    positions: list[dict] = []
+
+    # If payload is list, find GIA/STOCK portfolio
+    if isinstance(payload, list):
+        for p in payload:
+            if isinstance(p, dict) and (p.get("accountType") == "GIA" or "holdings" in p):
+                payload = p
+                break
+        else:
+            if payload:
+                payload = payload[0]
+
+    holdings = payload.get("holdings", []) if isinstance(payload, dict) else []
+    if not isinstance(holdings, list):
+        holdings = []
+
+    for h in holdings:
+        if not isinstance(h, dict):
+            continue
+        htype = h.get("assetType")
+        if htype == "CASH":
+            continue
+
+        symbol = h.get("symbol")
+        name = h.get("name")
+        ref = h.get("ref") or h.get("id")
+
+        isin = (h.get("assetInfo") or {}).get("isin")
+
+        qty_obj = h.get("balance") or {}
+        try:
+            qf = float(qty_obj.get("quantity") or 0)
+            qty = int(qf) if qf.is_integer() else qf
+        except Exception:
+            qty = 0
+
+        avg_obj = h.get("averagePrice")
+        avg_amt = _extract_amount(avg_obj)
+        cur = _extract_currency(avg_obj)
+
+        # Current price from tickers endpoint
+        last_price = None
+        if tickers_by_ref and isinstance(ref, str) and ref in tickers_by_ref:
+            t = tickers_by_ref.get(ref) or {}
+            # prefer lastPrecise if present
+            lp = t.get("lastPrecise")
+            if isinstance(lp, str):
+                try:
+                    last_price = float(lp)
+                except Exception:
+                    last_price = None
+            if last_price is None:
+                last_price = _extract_amount({"amount": t.get("last"), "currency": t.get("currency")})
+
+        price_amt = last_price if last_price is not None else avg_amt
+
+        pos: dict = {
+            "name": name,
+            "isin": isin or symbol,
+            "quantity": qty,
+            # For banker UI, "price" is interpreted as current price.
+            "price": {"amount": price_amt, "currency": (cur or (tickers_by_ref.get(ref, {}).get('currency') if tickers_by_ref and ref else None))},
+            # keep avg price for reference
+            "averagePrice": {"amount": avg_amt, "currency": cur},
+            "ref": ref,
+        }
+
+        # Enrichment if we have ticker + avg
+        if last_price is not None and avg_amt is not None and cur:
+            mv = qty * float(last_price)
+            pl = (float(last_price) - float(avg_amt)) * qty
+            pct = None
+            try:
+                if avg_amt and float(avg_amt) != 0:
+                    pct = ((float(last_price) / float(avg_amt)) - 1.0) * 100.0
+            except Exception:
+                pct = None
+
+            pos["marketValue"] = {"amount": mv, "currency": cur}
+            pos["performance"] = {
+                "absolute": {"amount": pl, "currency": cur},
+                "percent": pct,
+            }
+
+        positions.append(pos)
+
+    return {"positions": positions}
+
+def canonicalize_revolut_invest_tx(payload, name_map: dict | None = None) -> list[dict]:
+    """Canonicalize Revolut Invest trade history into banker 'depot transactions' shape.
+
+    Args:
+        payload: Raw transaction data from Revolut API
+        name_map: Optional dict mapping ref/symbol to stock name (e.g. {"TSLA": "Tesla"})
+    """
+    items = payload.get("items", [])
+    out: list[dict] = []
+    name_map = name_map or {}
+
+    for t in items:
+        if not isinstance(t, dict):
+            continue
+        if t.get("state") != "COMPLETED":
+            continue
+
+        # We focus on TRADE (buy/sell securities)
+        if t.get("type") != "TRADE":
+            continue
+
+        symbol = t.get("symbol")
+        ref = t.get("ref") or t.get("instrumentRef") or t.get("baseInstrumentRef")
+        # Try to get name from transaction, then from name_map by ref or symbol
+        name = t.get("name") or (t.get("instrument") or {}).get("name") if isinstance(t.get("instrument"), dict) else None
+        if not name and name_map:
+            name = name_map.get(ref) or name_map.get(symbol)
+        side = t.get("side")  # BUY/SELL
+
+        d = _to_date_iso(t.get("completedAt"))
+
+        qty = None
+        try:
+            qf = float(t.get("executedQuantity") or 0)
+            qty = int(qf) if qf.is_integer() else qf
+        except Exception:
+            qty = None
+
+        price_obj = t.get("executedPrice")
+        price_amt = _extract_amount(price_obj)
+        price_cur = _extract_currency(price_obj)
+
+        total_obj = t.get("total") or t.get("net")
+        total_amt = _extract_amount(total_obj)
+        total_cur = _extract_currency(total_obj)
+
+        # Banker UI expects:
+        # bookingDate, kind, security{isin,name}, quantity, unit, price{amount,currency}, venue, status
+        tx: dict = {
+            "bookingDate": d,
+            "status": "booked",
+            "kind": side.lower() if isinstance(side, str) and side else "trade",
+            "security": {
+                # We don't always have true ISIN; use ref if available, else ticker.
+                "isin": ref or symbol,
+                "name": name or symbol,
+            },
+            "quantity": qty,
+            # unit is implicit for equities; omit to keep canonical JSON clean
+            "price": {"amount": price_amt, "currency": price_cur},
+            "venue": "REVOLUT",
+            "amount": {"amount": total_amt, "currency": total_cur},
+            "description": f"{side} {symbol}" if side and symbol else None,
+        }
+
+        # Also keep a convenient fallback field (some older code paths look at tx['isin']).
+        tx["isin"] = (ref or symbol)
+
+        out.append(tx)
+
+    return out
+
+
+def _resolve_account_selector(accounts: list[dict], selector: str) -> dict:
+    q = (selector or "").strip().lower()
+    if not q: return accounts[0] if accounts else {}
+    for a in accounts:
+        if (a.get("id") or "").lower() == q: return a
+        if a.get("currency","").lower() == q: return a
+    return accounts[0] if accounts else {}
+
+
+def _handle_passcode_screen(page, passcode="060716"):
+    """Enter passcode if screen detected."""
+    try:
+        if _looks_like_passcode_screen(page.inner_text("body")):
+            print("[revolut] Passcode screen detected. Entering PIN...", file=sys.stderr)
+            # Find inputs. Usually 6 inputs or one hidden input?
+            # Based on research: input[aria-label="Code input 1"] ...
+            
+            # Try to find the first input
+            # HTML uses aria-label="Codeinput 1" (sometimes typo) or "Code input 1"
+            # Also inputmode="numeric" is a good target.
+            inputs = page.locator('input[aria-label^="Code input"], input[aria-label^="Codeinput"], input[inputmode="numeric"], input[type="password"]')
+            if inputs.count() > 0:
+                first = inputs.first
+                first.click()
+                time.sleep(0.5)
+                
+                # Type PIN
+                for digit in passcode:
+                    page.keyboard.type(digit)
+                    time.sleep(random.uniform(0.1, 0.3))
+                
+                print("[revolut] PIN entered. Waiting...", file=sys.stderr)
+                time.sleep(3)
+                return True
+    except Exception as e:
+        print(f"[revolut] Error handling passcode: {e}", file=sys.stderr)
+    return False
+
+_LAST_AUTH_EXPIRED = False
+
+
+class RevolutAuthExpired(Exception):
+    pass
+
+
+def _try_extract_qr_url(page) -> str | None:
+    # Try DOM attributes first
+    try:
+        loc = page.locator('[aria-label*="revolut.com/app/challenges/qr/"], [href*="revolut.com/app/challenges/qr/"]')
+        if loc.count() > 0:
+            el = loc.first
+            url = el.get_attribute("aria-label") or el.get_attribute("href")
+            if url and "revolut.com/app/challenges/qr/" in url:
+                return url
+    except:  # noqa: E722
+        pass
+
+    # Fallback: search HTML
+    try:
+        html = page.content() or ""
+        # some pages escape slashes
+        html = html.replace("\\/", "/")
+        m = re.search(r"https://revolut\\.com/app/challenges/qr/[^\"\s<]+", html)
+        if m:
+            return m.group(0)
+    except:  # noqa: E722
+        pass
+
+    return None
+
+
+def _handle_auth_challenge(page, success_url_pattern="**/home**", auth_timeout_ms: int = 600_000):
+    global _LAST_AUTH_EXPIRED
+    _LAST_AUTH_EXPIRED = False
+    """Handle PIN and/or QR code challenge if they appear.
+
+    Revolut can require:
+    - Passcode entry
+    - QR-based login approval
+    - (sometimes) just waiting for an SSO redirect
+    """
+
+    # Dismiss cookie banner first (might block UI)
+    try:
+        page.locator('button:has-text("Accept all cookies"), button:has-text("Accept all")').first.click(timeout=1000)
+    except:  # noqa: E722
+        pass
+
+    # 1) Passcode
+    if _handle_passcode_screen(page):
+        time.sleep(1)
+
+    # If we're already where we need to be, we're done.
+    try:
+        page.wait_for_url(success_url_pattern, timeout=2000)
+        return True
+    except:  # noqa: E722
+        pass
+
+    # 2) QR / approval
+    try:
+        login_url = _try_extract_qr_url(page)
+        if login_url:
+            print("[revolut] Auth challenge detected (QR).", file=sys.stderr)
+
+            # IMPORTANT:
+            # - Moltbot's watcher/bridge typically detects ::TELEGRAM_PAYLOAD:: on STDOUT.
+            # - Use --out to write JSON to a file; keep STDOUT free for this prompt.
+            
+            print(f"IMPORTANT: Approve in Revolut app via this link: {login_url}")
+            print(f"::TELEGRAM_PAYLOAD::{login_url}")
+            try:
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+            # Keep a trace in logs, but don't duplicate the payload line.
+            print(f"[revolut] IMPORTANT: Approve in Revolut app via: {login_url}", file=sys.stderr)
+        else:
+            # Still useful to capture what we're seeing
+            try:
+                shot = TMP_DIR / "revolut_auth_debug.png"
+                page.screenshot(path=str(shot))
+                print(f"[revolut] Auth challenge suspected but QR URL not detected. Screenshot: {shot}", file=sys.stderr)
+                print(f"[revolut] Current URL: {page.url}", file=sys.stderr)
+            except:  # noqa: E722
+                pass
+
+        # Wait for successful redirect (user approves in Revolut app).
+        # We poll so we can detect "QR code expired".
+        deadline = time.time() + (auth_timeout_ms / 1000.0)
+        while time.time() < deadline:
+            try:
+                body = (page.inner_text("body") or "").lower()
+                if "qr code expired" in body:
+                    raise RevolutAuthExpired("QR code expired")
+            except RevolutAuthExpired:
+                raise
+            except:  # noqa: E722
+                pass
+
+            try:
+                page.wait_for_url(success_url_pattern, timeout=1000)
+                print("[revolut] Login confirmed.", file=sys.stderr)
+                return True
+            except PlaywrightTimeout:
+                pass
+            except:  # noqa: E722
+                # likely target closed
+                break
+
+            time.sleep(0.5)
+
+        print("[revolut] Timed out waiting for auth.", file=sys.stderr)
+        return False
+
+    except RevolutAuthExpired:
+        _LAST_AUTH_EXPIRED = True
+        print("[revolut] QR code expired.", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"[revolut] Error while handling auth: {e}", file=sys.stderr)
+        return False
+
+
+def cmd_login(args) -> int:
+    _require_playwright()
+    state_file = _state_file_from_args(args)
+    _ensure_dir(state_file.parent)
+
+    with sync_playwright() as p:  # type: ignore[misc]
+        # Reuse state if exists to avoid full re-auth if possible
+        if state_file.exists():
+             context = p.chromium.launch(headless=False, slow_mo=50).new_context(
+                storage_state=str(state_file),
+                viewport={"width": 1280, "height": 800},
+                user_agent=DEFAULT_UA
+             )
+        else:
+             context = p.chromium.launch(headless=False, slow_mo=50).new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent=DEFAULT_UA
+             )
+             
+        page = context.new_page()
+        page.goto(REVOLUT_START_URL, wait_until="domcontentloaded")
+        time.sleep(2) # Wait for redirect or load
+        
+        if _handle_auth_challenge(page):
+            # Verify we are actually logged in?
+            try:
+                page.wait_for_url("**/home**", timeout=5000)
+                context.storage_state(path=str(state_file))
+                print(f"[revolut] Login successful. State saved to: {state_file}")
+                return 0
+            except:
+                print("[revolut] Login flow finished but did not reach Home. Check manual intervention.", file=sys.stderr)
+                return 1
+        return 1
+
+
+def cmd_logout(args) -> int:
+    state_file = _state_file_from_args(args)
+    if state_file.exists():
+        state_file.unlink()
+        print(f"[revolut] Deleted state: {state_file}")
+    else:
+        print(f"[revolut] No state file found at: {state_file}")
+    return 0
+
+
+def cmd_accounts(args) -> int:
+    _require_playwright()
+    state_file = _state_file_from_args(args)
+    if not state_file.exists():
+        print(f"[revolut] ERROR: No session state found. Run: revolut.py login", file=sys.stderr)
+        return 2
+
+    debug = bool(getattr(args, "debug", False))
+    headless = not bool(getattr(args, "visible", False))
+
+    with sync_playwright() as p:  # type: ignore[misc]
+        # Always visible for now to pass Cloudflare/Auth
+        browser = p.chromium.launch(headless=headless, slow_mo=50)
+        context = browser.new_context(
+            storage_state=str(state_file),
+            viewport={"width": 1280, "height": 800},
+            user_agent=DEFAULT_UA,
+        )
+        page = context.new_page()
+
+        # Check for passcode/QR if redirected to login
+        try:
+            page.goto(REVOLUT_HOME_URL, wait_until="domcontentloaded", timeout=15000)
+            ok = _handle_auth_challenge(page, success_url_pattern="**/home**")
+            if not ok:
+                if _LAST_AUTH_EXPIRED:
+                    print("QR code expired, please try again", file=sys.stderr)
+                else:
+                    print("[revolut] Auth not completed.", file=sys.stderr)
+                browser.close()
+                return 3
+            time.sleep(2)
+        except Exception:
+            pass
+
+        # Prefer JS fetch (more reliable than interception)
+        headers = _get_api_headers(page)
+        raw = _fetch_via_api_call(page, "/api/retail/wallets", headers)
+
+        # Fallback to interception if needed
+        if raw is None:
+            raw = _fetch_via_interception(page, "/api/retail/wallets")
+
+        if not raw:
+            print("[revolut] Failed to fetch accounts data. Session invalid or CF blocked.", file=sys.stderr)
+            if debug:
+                try:
+                    page.screenshot(path=str(state_file.parent / "revolut_debug_fetch.png"))
+                except Exception:
+                    pass
+            browser.close()
+            return 3
+
+        if debug:
+            _write_json(state_file.parent / "revolut_raw_accounts.json", raw)
+
+        accounts = canonicalize_revolut_accounts(raw)
+
+        # Optional: include Invest depot summary as a synthetic "depot" account.
+        if bool(getattr(args, "include_depot", False)):
+            portfolio_id = getattr(args, "portfolio_id", None)
+            depot_account_id = getattr(args, "depot_account", "revolut_gia")
+
+            # We need to enter Invest context to access its APIs.
+            try:
+                page.goto(INVEST_HOME_URL, wait_until="domcontentloaded", timeout=15000)
+                ok = _handle_auth_challenge(page, success_url_pattern="**/portfolio**")
+                if not ok:
+                    if _LAST_AUTH_EXPIRED:
+                        print("QR code expired, please try again", file=sys.stderr)
+                    else:
+                        print("[revolut] Auth not completed.", file=sys.stderr)
+                    browser.close()
+                    return 3
+                time.sleep(1)
+
+                invest_headers = _get_api_headers(page)
+
+                # Determine portfolio id if not provided.
+                pid = portfolio_id
+                if not pid:
+                    raw_list = _fetch_via_api_call(page, "/api/retail/trading-access/portfolios", invest_headers)
+                    if isinstance(raw_list, list):
+                        for p0 in raw_list:
+                            if isinstance(p0, dict) and p0.get("state") == "ACTIVE" and p0.get("accountType") == "GIA":
+                                pid = p0.get("id")
+                                break
+
+                depot_currency = "USD"
+                depot_value = None
+                depot_pl = None
+                depot_pct = None
+
+                if pid and isinstance(pid, str):
+                    raw_pf = _fetch_via_api_call(page, f"/api/retail/trading-access/portfolios/{pid}", invest_headers)
+                    tickers_by_ref = {}
+                    holdings = raw_pf.get("holdings", []) if isinstance(raw_pf, dict) else []
+                    refs = []
+                    if isinstance(holdings, list):
+                        for h in holdings:
+                            if isinstance(h, dict) and h.get("assetType") != "CASH":
+                                r = h.get("ref") or h.get("id")
+                                if isinstance(r, str) and r:
+                                    refs.append(r)
+                    refs = sorted(set(refs))
+                    if refs:
+                        tickers = _fetch_via_api_call(page, "/api/retail/instruments/tickers", invest_headers, method="POST", body=refs)
+                        if isinstance(tickers, list):
+                            for t in tickers:
+                                if isinstance(t, dict) and isinstance(t.get("ref"), str):
+                                    tickers_by_ref[t["ref"]] = t
+
+                    canon_pf = canonicalize_revolut_portfolio(raw_pf, tickers_by_ref=tickers_by_ref)
+                    positions = canon_pf.get("positions", [])
+
+                    # Compute totals
+                    total_mv = 0.0
+                    total_pl = 0.0
+                    total_cost = 0.0
+                    for pos in positions:
+                        if not isinstance(pos, dict):
+                            continue
+                        mv = pos.get("marketValue") if isinstance(pos.get("marketValue"), dict) else None
+                        perf = pos.get("performance") if isinstance(pos.get("performance"), dict) else None
+                        avg = pos.get("averagePrice") if isinstance(pos.get("averagePrice"), dict) else None
+                        qty = pos.get("quantity")
+                        try:
+                            q = float(qty) if qty is not None else 0.0
+                        except Exception:
+                            q = 0.0
+                        if isinstance(mv, dict) and mv.get("amount") is not None:
+                            try:
+                                total_mv += float(mv.get("amount"))
+                            except Exception:
+                                pass
+                            depot_currency = mv.get("currency") or depot_currency
+                        if isinstance(perf, dict):
+                            abs_ = perf.get("absolute") if isinstance(perf.get("absolute"), dict) else None
+                            if isinstance(abs_, dict) and abs_.get("amount") is not None:
+                                try:
+                                    total_pl += float(abs_.get("amount"))
+                                except Exception:
+                                    pass
+                        if isinstance(avg, dict) and avg.get("amount") is not None:
+                            try:
+                                total_cost += float(avg.get("amount")) * q
+                            except Exception:
+                                pass
+
+                    depot_value = total_mv
+                    depot_pl = total_pl
+                    if total_cost:
+                        depot_pct = (total_pl / total_cost) * 100.0
+
+                depot_acct = {
+                    "id": depot_account_id,
+                    "type": "depot",
+                    "name": "Revolut Invest (GIA)",
+                    "currency": depot_currency,
+                }
+                if depot_value is not None or depot_pl is not None:
+                    depot_acct["securities"] = {
+                        "value": {"amount": depot_value, "currency": depot_currency},
+                        "profitLoss": {"amount": depot_pl, "currency": depot_currency, "percent": depot_pct},
+                    }
+
+                # Replace existing synthetic depot entry if present
+                accounts = [a for a in accounts if a.get("id") != depot_account_id]
+                accounts.append(depot_acct)
+
+            except Exception as e:
+                print(f"[revolut] Failed to include depot: {e}", file=sys.stderr)
+
+        wrapper: dict[str, Any] = {
+            "institution": "revolut",
+            "fetchedAt": _now_iso_local(),
+            "accounts": accounts,
+        }
+
+        out_path = getattr(args, "out", None)
+        if out_path:
+            Path(out_path).expanduser().resolve().write_text(
+                json.dumps(wrapper, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"[revolut] Wrote JSON: {out_path}", file=sys.stderr)
+        else:
+            print(json.dumps(wrapper, ensure_ascii=False, indent=2))
+        browser.close()
+        return 0
+
+
+def _get_api_headers(page) -> dict:
+    """Capture headers from background requests to reuse authentication tokens."""
+    captured = []
+    def on_request(request):
+        if "/api/retail" in request.url and not captured:
+            h = request.headers
+            if "x-device-id" in h:
+                captured.append(h)
+                
+    page.on("request", on_request)
+    
+    # Wait up to 5s for a request (usually Home loads them immediately)
+    for _ in range(50):
+        if captured:
+            break
+        try:
+            page.wait_for_timeout(100)
+        except:  # noqa: E722
+            break
+        
+    if captured:
+        orig = captured[0]
+        # Copy relevant headers
+        out = {}
+        # These seem critical for Revolut API
+        keys = ["x-device-id", "x-browser-application", "x-client-version", "x-timezone", "device-id"]
+        for k in keys:
+            if k in orig: out[k] = orig[k]
+        return out
+    return {}
+
+def _fetch_via_api_call(page, url: str, extra_headers: dict = {}, method: str = "GET", body: Any = None) -> Any:
+    """Execute fetch() inside the page context to get data directly."""
+    headers_json = json.dumps(extra_headers)
+    method_json = json.dumps(method)
+    body_json = json.dumps(body)
+
+    try:
+        print(f"[revolut] Fetching via JS: {method} {url}", file=sys.stderr)
+        result = page.evaluate(
+            f"""
+            async () => {{
+                try {{
+                    const extra = {headers_json};
+                    const method = {method_json};
+                    const body = {body_json};
+
+                    const headers = {{
+                        'Accept': 'application/json',
+                        ...extra
+                    }};
+
+                    const opts = {{ method, headers, credentials: 'include' }};
+                    if (body !== null && body !== undefined) {{
+                        headers['Content-Type'] = 'application/json';
+                        opts.body = JSON.stringify(body);
+                    }}
+
+                    const res = await fetch("{url}", opts);
+                    if (!res.ok) return {{ error: String(res.status) + " " + (res.statusText || "") }};
+                    return await res.json();
+                }} catch (e) {{
+                    return {{ error: e.toString() }};
+                }}
+            }}
+            """
+        )
+
+        if isinstance(result, dict) and "error" in result:
+            print(f"[revolut] JS fetch error: {result['error']}", file=sys.stderr)
+            return None
+        return result
+    except Exception as e:
+        print(f"[revolut] API fetch failed: {e}", file=sys.stderr)
+        return None
+
+def cmd_transactions(args) -> int:
+    _require_playwright()
+    state_file = _state_file_from_args(args)
+    if not state_file.exists():
+        print(f"[revolut] ERROR: No session state found. Run: revolut.py login", file=sys.stderr)
+        return 2
+
+    debug = bool(getattr(args, "debug", False))
+    headless = not bool(getattr(args, "visible", False))
+    count = int(getattr(args, "count", 50) or 50)
+    account_id = getattr(args, "account", None)
+
+    with sync_playwright() as p:  # type: ignore[misc]
+        browser = p.chromium.launch(headless=headless, slow_mo=50)
+        context = browser.new_context(
+            storage_state=str(state_file),
+            viewport={"width": 1280, "height": 800},
+            user_agent=DEFAULT_UA,
+        )
+        page = context.new_page()
+        
+        try:
+            page.goto(REVOLUT_HOME_URL, wait_until="domcontentloaded", timeout=15000)
+            _handle_auth_challenge(page)
+            # Wait a bit for auth/cookies to settle
+            time.sleep(2)
+        except: pass
+
+        # Construct API URL
+        # Default: last transactions (mixed)
+        # If account provided: use internalPocketId
+        base_url = f"/api/retail/user/current/transactions/last?count={count}"
+        if account_id:
+            # We assume the user passed the UUID. If they passed a name/currency, we can't easily resolve it without fetching accounts first.
+            # But usually we pass UUIDs.
+            # However, if it's a UUID, we append internalPocketId.
+            # If it's not a UUID (like "USD"), we might fail. 
+            # Ideally we should resolve it, but let's assume UUID for now or try to fetch regardless.
+            
+            # Simple UUID check regex
+            if re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', account_id, re.I):
+                base_url += f"&internalPocketId={account_id}"
+            else:
+                 print(f"[revolut] Warning: Account ID '{account_id}' does not look like a UUID. API might ignore it or fail.", file=sys.stderr)
+
+        # Capture headers from environment
+        api_headers = _get_api_headers(page)
+        
+        # Use JS fetch instead of interception for reliability and param support
+        raw_txs = _fetch_via_api_call(page, base_url, api_headers)
+        
+        # Fallback to interception if JS fetch returns null (e.g. CORS or strict CSP, though usually fine on same origin)
+        if raw_txs is None:
+             print("[revolut] JS fetch returned null. Trying interception fallback...", file=sys.stderr)
+             raw_txs = _fetch_via_interception(page, "/api/retail/user/current/transactions/last")
+        
+        if not raw_txs:
+             print("[revolut] Failed to fetch transactions.", file=sys.stderr)
+             browser.close()
+             return 3
+
+        if debug:
+            _write_json(state_file.parent / "revolut_raw_transactions.json", raw_txs)
+
+        txs = canonicalize_revolut_transactions(raw_txs, filter_account_id=account_id)
+        
+        wrapper: dict[str, Any] = {
+            "institution": "revolut",
+            "fetchedAt": _now_iso_local(),
+            "transactions": txs,
+        }
+        
+        if account_id:
+            wrapper["account"] = {"id": account_id}
+
+        out_path = getattr(args, "out", None)
+        if out_path:
+            Path(out_path).expanduser().resolve().write_text(
+                json.dumps(wrapper, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"[revolut] Wrote JSON: {out_path}", file=sys.stderr)
+        else:
+            print(json.dumps(wrapper, ensure_ascii=False, indent=2))
+        browser.close()
+        return 0
+
+
+def cmd_portfolio(args) -> int:
+    _require_playwright()
+    state_file = _state_file_from_args(args)
+    if not state_file.exists():
+        print(f"[revolut] ERROR: No session state found. Run: revolut.py login", file=sys.stderr)
+        return 2
+
+    debug = bool(getattr(args, "debug", False))
+    headless = not bool(getattr(args, "visible", False))
+    portfolio_id = getattr(args, "id", None)
+    account_id = getattr(args, "account", None)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless, slow_mo=50)
+        context = browser.new_context(
+            storage_state=str(state_file),
+            viewport={"width": 1280, "height": 800},
+            user_agent=DEFAULT_UA,
+        )
+        page = context.new_page()
+
+        try:
+            page.goto(INVEST_HOME_URL, wait_until="domcontentloaded", timeout=15000)
+            ok = _handle_auth_challenge(page, success_url_pattern="**/portfolio**")
+            if not ok:
+                if _LAST_AUTH_EXPIRED:
+                    print("QR code expired, please try again", file=sys.stderr)
+                else:
+                    print("[revolut] Auth not completed.", file=sys.stderr)
+                browser.close()
+                return 3
+            time.sleep(2)
+        except:  # noqa: E722
+            pass
+
+        headers = _get_api_headers(page)
+
+        # If caller provided a portfolio id, fetch that directly.
+        raw = None
+        if portfolio_id:
+            raw = _fetch_via_api_call(page, f"/api/retail/trading-access/portfolios/{portfolio_id}", headers)
+
+        # Otherwise try list + pick first ACTIVE/GIA id.
+        if not raw:
+            raw_list = _fetch_via_api_call(page, "/api/retail/trading-access/portfolios", headers)
+            if isinstance(raw_list, list) and raw_list:
+                picked = None
+                for p0 in raw_list:
+                    if isinstance(p0, dict) and p0.get("state") == "ACTIVE" and p0.get("accountType") == "GIA":
+                        picked = p0
+                        break
+                if picked is None:
+                    picked = raw_list[0]
+                pid = picked.get("id") if isinstance(picked, dict) else None
+                if pid:
+                    raw = _fetch_via_api_call(page, f"/api/retail/trading-access/portfolios/{pid}", headers)
+                else:
+                    raw = picked
+            else:
+                # Fallback: interception
+                raw = _fetch_via_interception(page, "/api/retail/trading-access/portfolios")
+
+        if not raw:
+            print("[revolut] Failed to fetch portfolio.", file=sys.stderr)
+            browser.close()
+            return 3
+
+        if debug:
+            _write_json(state_file.parent / "revolut_raw_portfolio.json", raw)
+
+        # Enrich holdings with current prices to compute value + performance
+        tickers_by_ref = {}
+        try:
+            holdings = raw.get("holdings", []) if isinstance(raw, dict) else []
+            refs = []
+            if isinstance(holdings, list):
+                for h in holdings:
+                    if isinstance(h, dict) and (h.get("assetType") != "CASH"):
+                        r = h.get("ref") or h.get("id")
+                        if isinstance(r, str) and r:
+                            refs.append(r)
+            # De-dupe refs
+            refs = sorted(set(refs))
+            if refs:
+                tickers = _fetch_via_api_call(page, "/api/retail/instruments/tickers", headers, method="POST", body=refs)
+                if isinstance(tickers, list):
+                    for t in tickers:
+                        if isinstance(t, dict) and isinstance(t.get("ref"), str):
+                            tickers_by_ref[t["ref"]] = t
+        except Exception:
+            pass
+
+        canon = canonicalize_revolut_portfolio(raw, tickers_by_ref=tickers_by_ref)
+        wrapper = {
+            "institution": "revolut",
+            "fetchedAt": _now_iso_local(),
+            "kind": "portfolio",
+            "account": {"id": account_id} if account_id else None,
+            **canon,
+        }
+        # Remove null account if not provided
+        if wrapper.get("account") is None:
+            wrapper.pop("account")
+
+        out_path = getattr(args, "out", None)
+        if out_path:
+            Path(out_path).expanduser().resolve().write_text(
+                json.dumps(wrapper, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"[revolut] Wrote JSON: {out_path}", file=sys.stderr)
+        else:
+            print(json.dumps(wrapper, ensure_ascii=False, indent=2))
+        browser.close()
+        return 0
+
+def cmd_invest_scan(args) -> int:
+    """Load Invest dashboard and print all /api/retail request URLs observed.
+
+    Useful to discover endpoints for portfolio valuation/performance.
+    """
+    _require_playwright()
+    state_file = _state_file_from_args(args)
+    if not state_file.exists():
+        print(f"[revolut] ERROR: No session state found. Run: revolut.py login", file=sys.stderr)
+        return 2
+
+    headless = not bool(getattr(args, "visible", False))
+
+    with sync_playwright() as p:  # type: ignore[misc]
+        browser = p.chromium.launch(headless=headless, slow_mo=50)
+        context = browser.new_context(
+            storage_state=str(state_file),
+            viewport={"width": 1280, "height": 800},
+            user_agent=DEFAULT_UA,
+        )
+        page = context.new_page()
+
+        urls: set[str] = set()
+
+        def on_request(req):
+            try:
+                u = req.url
+                if "/api/retail" in u:
+                    urls.add(u)
+            except Exception:
+                pass
+
+        page.on("request", on_request)
+
+        try:
+            page.goto(INVEST_HOME_URL, wait_until="domcontentloaded", timeout=15000)
+            ok = _handle_auth_challenge(page, success_url_pattern="**/portfolio**")
+            if not ok:
+                if _LAST_AUTH_EXPIRED:
+                    print("QR code expired, please try again", file=sys.stderr)
+                else:
+                    print("[revolut] Auth not completed.", file=sys.stderr)
+                browser.close()
+                return 3
+
+            # Trigger more network activity
+            try:
+                page.reload(wait_until="networkidle", timeout=30000)
+            except Exception:
+                pass
+            time.sleep(2)
+
+        except Exception as e:
+            print(f"[revolut] invest-scan failed: {e}", file=sys.stderr)
+            browser.close()
+            return 3
+
+        payload = {"observed": len(urls), "urls": sorted(urls)}
+
+        out_path = getattr(args, "out", None)
+        if out_path:
+            Path(out_path).expanduser().resolve().write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"[revolut] Wrote JSON: {out_path}", file=sys.stderr)
+        else:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        browser.close()
+        return 0
+
+
+def cmd_invest_transactions(args) -> int:
+    _require_playwright()
+    state_file = _state_file_from_args(args)
+    if not state_file.exists():
+        print(f"[revolut] ERROR: No session state found. Run: revolut.py login", file=sys.stderr)
+        return 2
+        
+    debug = bool(getattr(args, "debug", False))
+    headless = not bool(getattr(args, "visible", False))
+    count = int(getattr(args, "count", 100) or 100)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless, slow_mo=50)
+        context = browser.new_context(storage_state=str(state_file), viewport={"width": 1280, "height": 800}, user_agent=DEFAULT_UA)
+        page = context.new_page()
+        
+        try:
+            page.goto(INVEST_HOME_URL, wait_until="domcontentloaded", timeout=15000)
+            ok = _handle_auth_challenge(page, success_url_pattern="**/portfolio**")
+            if not ok:
+                if _LAST_AUTH_EXPIRED:
+                    print("QR code expired, please try again", file=sys.stderr)
+                else:
+                    print("[revolut] Auth not completed.", file=sys.stderr)
+                browser.close()
+                return 3
+            time.sleep(2)
+        except:  # noqa: E722
+            pass
+        
+        headers = _get_api_headers(page)
+
+        # Fetch portfolio holdings to build name map (ref/symbol -> name)
+        name_map: dict[str, str] = {}
+        try:
+            raw_list = _fetch_via_api_call(page, "/api/retail/trading-access/portfolios", headers)
+            if isinstance(raw_list, list):
+                for pf in raw_list:
+                    pid = pf.get("id") if isinstance(pf, dict) else None
+                    if pid:
+                        raw_pf = _fetch_via_api_call(page, f"/api/retail/trading-access/portfolios/{pid}", headers)
+                        holdings = raw_pf.get("holdings", []) if isinstance(raw_pf, dict) else []
+                        if isinstance(holdings, list):
+                            for h in holdings:
+                                if not isinstance(h, dict):
+                                    continue
+                                hname = h.get("name")
+                                if hname:
+                                    ref = h.get("ref") or h.get("id")
+                                    symbol = h.get("symbol")
+                                    if ref:
+                                        name_map[ref] = hname
+                                    if symbol:
+                                        name_map[symbol] = hname
+        except Exception:
+            pass  # Continue without name enrichment if portfolio fetch fails
+
+        to_ms = int(time.time() * 1000)
+        url = f"/api/retail/trading/transactions?limit={count}&accountType=GIA&accountType=MARGIN&to={to_ms}&from=0"
+        raw = _fetch_via_api_call(page, url, headers)
+
+        if not raw:
+             print("[revolut] Failed to fetch invest transactions.", file=sys.stderr)
+             browser.close()
+             return 3
+
+        if debug: _write_json(state_file.parent / "revolut_raw_invest_tx.json", raw)
+
+        txs = canonicalize_revolut_invest_tx(raw, name_map=name_map)
+        wrapper = {
+            "institution": "revolut",
+            "fetchedAt": _now_iso_local(),
+            "transactions": txs
+        }
+
+        out_path = getattr(args, "out", None)
+        if out_path:
+            Path(out_path).expanduser().resolve().write_text(
+                json.dumps(wrapper, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"[revolut] Wrote JSON: {out_path}", file=sys.stderr)
+        else:
+            print(json.dumps(wrapper, ensure_ascii=False, indent=2))
+        browser.close()
+        return 0
+
+
+# ------------------------- Legacy Import Commands -------------------------
+
+def cmd_import_accounts(args) -> int:
+    debug = bool(getattr(args, "debug", False))
+    src = args.source
+    fpath = Path(args.file).expanduser()
+
+    if src == "csv":
+        rows = parse_revolut_csv_rows(fpath)
+        accounts, raw = revolut_accounts_from_csv(rows, debug=debug)
+        wrapper: dict[str, Any] = {
+            "institution": "revolut",
+            "fetchedAt": _now_iso_local(),
+            "accounts": accounts,
+        }
+        if debug and raw is not None:
+            wrapper["raw"] = raw
+
+    else:
+        md_path = TMP_DIR / "text" / (fpath.stem + ".md")
+        _ensure_dir(md_path.parent)
+        parse_pdf_to_markdown(fpath, md_path)
+        md_text = md_path.read_text(encoding="utf-8", errors="ignore")
+
+        accounts, raw = revolut_accounts_from_pdf(md_text, debug=debug)
+        wrapper = {
+            "institution": "revolut",
+            "fetchedAt": _now_iso_local(),
+            "accounts": accounts,
+        }
+        if debug and raw is not None:
+            raw["mdPath"] = str(md_path)
+            wrapper["raw"] = raw
+
+    print(json.dumps(wrapper, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_import_transactions(args) -> int:
+    debug = bool(getattr(args, "debug", False))
+
+    # resolve output base
+    out_base: Path
+    out_path = Path(args.out).expanduser()
+    if out_path.is_dir() or str(args.out).endswith(os.sep):
+        _ensure_dir(out_path)
+        safe_acc = args.account.replace(" ", "")
+        out_base = out_path / f"transactions_{safe_acc}_{args.date_from}_{args.date_until}"
+    else:
+        _ensure_dir(out_path.parent)
+        out_base = out_path
+
+    date_from = _parse_iso_date(args.date_from)
+    date_until = _parse_iso_date(args.date_until)
+
+    if args.source == "csv":
+        raw_rows = parse_revolut_csv_rows(Path(args.file))
+        canon_txs, raw_kept = canonicalize_revolut_csv_transactions(
+            raw_rows,
+            account=args.account,
+            date_from=date_from,
+            date_until=date_until,
+            debug=debug,
+        )
+        wrapper: dict[str, Any] = {
+            "institution": "revolut",
+            "account": {"id": args.account, "iban": None},
+            "range": {"from": date_from, "until": date_until},
+            "fetchedAt": _now_iso_local(),
+            "transactions": canon_txs,
+        }
+        if debug:
+            wrapper["raw"] = {"schema": "revolut-csv-v1", "rows": raw_kept}
+
+    else:
+        md_path = out_base.with_suffix(".md")
+        parse_pdf_to_markdown(Path(args.file), md_path)
+        md_text = md_path.read_text(encoding="utf-8", errors="ignore")
+        canon_txs, parsed_debug = canonicalize_revolut_pdf_transactions(
+            md_text,
+            account=args.account,
+            date_from=date_from,
+            date_until=date_until,
+            debug=debug,
+        )
+        wrapper = {
+            "institution": "revolut",
+            "account": {"id": args.account, "iban": parsed_debug.get("iban") if debug else None},
+            "range": {"from": date_from, "until": date_until},
+            "fetchedAt": _now_iso_local(),
+            "transactions": canon_txs,
+        }
+        if debug:
+            wrapper["raw"] = {"schema": "revolut-pdf-md-v1", "parsed": parsed_debug, "mdPath": str(md_path)}
+
+    out_file = out_base.with_suffix(".json")
+    out_file.write_text(json.dumps(wrapper, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[revolut] Saved JSON: {out_file}")
+    return 0
+
+
+# ------------------------- CLI -------------------------
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Revolut CLI (web automation + statement importer)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # Global flags
+    parser.add_argument("--visible", action="store_true", help="Show browser window (web commands)")
+    parser.add_argument("--state", default=None, help=f"Path to storage state (default: {DEFAULT_STATE_FILE})")
+    parser.add_argument("--debug", action="store_true", help="Save raw Revolut payloads")
+    parser.add_argument("--out", default=None, help="Write JSON output to file (so STDOUT can be used for QR prompts)")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # Web commands
+    p_login = sub.add_parser("login", help="Login via QR code and save storage state")
+    p_login.set_defaults(func=cmd_login)
+
+    p_logout = sub.add_parser("logout", help="Delete storage state")
+    p_logout.set_defaults(func=cmd_logout)
+
+    p_acc = sub.add_parser("accounts", help="Fetch accounts (wallets) from Revolut Web")
+    p_acc.add_argument("--json", action="store_true", help="(kept for parity)")
+    p_acc.add_argument("--include-depot", action="store_true", help="Include Invest depot account (requires extra auth)")
+    p_acc.add_argument("--portfolio-id", default=None, help="Invest portfolio id (UUID) for depot enrichment")
+    p_acc.add_argument("--depot-account", default="revolut_gia", help="Account id to use for the depot in banker")
+    p_acc.set_defaults(func=cmd_accounts)
+
+    p_tx = sub.add_parser("transactions", help="Fetch latest transactions from Revolut Web")
+    p_tx.add_argument("--account", default=None, help="Account selector")
+    p_tx.add_argument("--count", type=int, default=50, help="How many transactions to request")
+    p_tx.set_defaults(func=cmd_transactions)
+
+    p_port = sub.add_parser("portfolio", help="Fetch investment portfolio")
+    p_port.add_argument("--id", default=None, help="Portfolio id (UUID) for /trading-access/portfolios/{id}")
+    p_port.add_argument("--account", default=None, help="Account id to store under (e.g. revolut_gia)")
+    p_port.set_defaults(func=cmd_portfolio)
+
+    p_iscan = sub.add_parser("invest-scan", help="Discover Invest API endpoints (prints observed /api/retail URLs)")
+    p_iscan.set_defaults(func=cmd_invest_scan)
+
+    p_itx = sub.add_parser("invest-transactions", help="Fetch investment transactions")
+    p_itx.add_argument("--count", type=int, default=100)
+    p_itx.set_defaults(func=cmd_invest_transactions)
+
+    # Import commands
+    p_imp = sub.add_parser("import", help="Import from Revolut statement files (CSV/PDF)")
+    imp = p_imp.add_subparsers(dest="import_cmd", required=True)
+
+    imp_acc = imp.add_parser("accounts", help="Import accounts snapshot")
+    imp_acc.add_argument("--source", choices=["csv", "pdf"], required=True)
+    imp_acc.add_argument("--file", type=Path, required=True)
+    imp_acc.set_defaults(func=cmd_import_accounts)
+
+    imp_tx = imp.add_parser("transactions", help="Import transactions")
+    imp_tx.add_argument("--source", choices=["csv", "pdf"], required=True)
+    imp_tx.add_argument("--file", type=Path, required=True)
+    imp_tx.add_argument("--account", required=True)
+    imp_tx.add_argument("--from", dest="date_from", required=True)
+    imp_tx.add_argument("--until", dest="date_until", required=True)
+    imp_tx.add_argument("--format", choices=["json"], default="json")
+    imp_tx.add_argument("--out", type=Path, default=TMP_DIR)
+    imp_tx.set_defaults(func=cmd_import_transactions)
+
+    args = parser.parse_args()
+    return int(args.func(args) or 0)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

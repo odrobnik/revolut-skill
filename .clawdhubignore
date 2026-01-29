@@ -1,0 +1,10 @@
+.git/
+.DS_Store
+__pycache__/
+*.pyc
+.env
+README.md
+references/
+# Local secrets
+secrets/
+tokens-*.json
