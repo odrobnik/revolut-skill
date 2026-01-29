@@ -1,21 +1,13 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-"""Revolut automation + statement importer.
+"""Revolut web automation (Playwright).
 
-This script provides two feature sets:
-
-1) Web automation (Playwright)
-   - login: QR-code login and save storage state
-   - logout: delete saved storage state
-   - accounts: fetch wallet accounts via Revolut Web API
-   - transactions: fetch latest transactions via Revolut Web API
-
-2) Statement import (CSV/PDF)
-   - import accounts
-   - import transactions
-
-The statement importer is the original functionality of this skill.
+Commands:
+- login: QR-code login and save storage state
+- logout: delete saved storage state
+- accounts: fetch wallet accounts via Revolut Web API
+- transactions: fetch latest transactions via Revolut Web API
 """
 
 import sys
@@ -49,7 +41,6 @@ else:
         PlaywrightTimeout = Exception  # type: ignore
 
 
-SWIFTTEXT_BIN = Path("/Users/oliver/Developer/SwiftText/.build/arm64-apple-macosx/debug/swifttext")
 WORKSPACE_DIR = Path(os.environ.get("MOLTBOT_WORKSPACE", "/Users/oliver/clawd")).expanduser().resolve()
 
 # Ephemeral outputs (OCR markdown + default JSON output dir) go to /tmp by default.
@@ -1391,125 +1382,25 @@ def cmd_invest_transactions(args) -> int:
         return 0
 
 
-# ------------------------- Legacy Import Commands -------------------------
-
-def cmd_import_accounts(args) -> int:
-    debug = bool(getattr(args, "debug", False))
-    src = args.source
-    fpath = Path(args.file).expanduser()
-
-    if src == "csv":
-        rows = parse_revolut_csv_rows(fpath)
-        accounts, raw = revolut_accounts_from_csv(rows, debug=debug)
-        wrapper: dict[str, Any] = {
-            "institution": "revolut",
-            "fetchedAt": _now_iso_local(),
-            "accounts": accounts,
-        }
-        if debug and raw is not None:
-            wrapper["raw"] = raw
-
-    else:
-        md_path = TMP_DIR / "text" / (fpath.stem + ".md")
-        _ensure_dir(md_path.parent)
-        parse_pdf_to_markdown(fpath, md_path)
-        md_text = md_path.read_text(encoding="utf-8", errors="ignore")
-
-        accounts, raw = revolut_accounts_from_pdf(md_text, debug=debug)
-        wrapper = {
-            "institution": "revolut",
-            "fetchedAt": _now_iso_local(),
-            "accounts": accounts,
-        }
-        if debug and raw is not None:
-            raw["mdPath"] = str(md_path)
-            wrapper["raw"] = raw
-
-    print(json.dumps(wrapper, ensure_ascii=False, indent=2))
-    return 0
-
-
-def cmd_import_transactions(args) -> int:
-    debug = bool(getattr(args, "debug", False))
-
-    # resolve output base
-    out_base: Path
-    out_path = Path(args.out).expanduser()
-    if out_path.is_dir() or str(args.out).endswith(os.sep):
-        _ensure_dir(out_path)
-        safe_acc = args.account.replace(" ", "")
-        out_base = out_path / f"transactions_{safe_acc}_{args.date_from}_{args.date_until}"
-    else:
-        _ensure_dir(out_path.parent)
-        out_base = out_path
-
-    date_from = _parse_iso_date(args.date_from)
-    date_until = _parse_iso_date(args.date_until)
-
-    if args.source == "csv":
-        raw_rows = parse_revolut_csv_rows(Path(args.file))
-        canon_txs, raw_kept = canonicalize_revolut_csv_transactions(
-            raw_rows,
-            account=args.account,
-            date_from=date_from,
-            date_until=date_until,
-            debug=debug,
-        )
-        wrapper: dict[str, Any] = {
-            "institution": "revolut",
-            "account": {"id": args.account, "iban": None},
-            "range": {"from": date_from, "until": date_until},
-            "fetchedAt": _now_iso_local(),
-            "transactions": canon_txs,
-        }
-        if debug:
-            wrapper["raw"] = {"schema": "revolut-csv-v1", "rows": raw_kept}
-
-    else:
-        md_path = out_base.with_suffix(".md")
-        parse_pdf_to_markdown(Path(args.file), md_path)
-        md_text = md_path.read_text(encoding="utf-8", errors="ignore")
-        canon_txs, parsed_debug = canonicalize_revolut_pdf_transactions(
-            md_text,
-            account=args.account,
-            date_from=date_from,
-            date_until=date_until,
-            debug=debug,
-        )
-        wrapper = {
-            "institution": "revolut",
-            "account": {"id": args.account, "iban": parsed_debug.get("iban") if debug else None},
-            "range": {"from": date_from, "until": date_until},
-            "fetchedAt": _now_iso_local(),
-            "transactions": canon_txs,
-        }
-        if debug:
-            wrapper["raw"] = {"schema": "revolut-pdf-md-v1", "parsed": parsed_debug, "mdPath": str(md_path)}
-
-    out_file = out_base.with_suffix(".json")
-    out_file.write_text(json.dumps(wrapper, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[revolut] Saved JSON: {out_file}")
-    return 0
-
-
 # ------------------------- CLI -------------------------
+
+
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Revolut CLI (web automation + statement importer)",
+        description="Revolut CLI (web automation)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     # Global flags
-    parser.add_argument("--visible", action="store_true", help="Show browser window (web commands)")
+    parser.add_argument("--visible", action="store_true", help="Show browser window")
     parser.add_argument("--state", default=None, help=f"Path to storage state (default: {DEFAULT_STATE_FILE})")
     parser.add_argument("--debug", action="store_true", help="Save raw Revolut payloads")
     parser.add_argument("--out", default=None, help="Write JSON output to file (so STDOUT can be used for QR prompts)")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # Web commands
     p_login = sub.add_parser("login", help="Login via QR code and save storage state")
     p_login.set_defaults(func=cmd_login)
 
@@ -1518,46 +1409,12 @@ def main() -> int:
 
     p_acc = sub.add_parser("accounts", help="Fetch accounts (wallets) from Revolut Web")
     p_acc.add_argument("--json", action="store_true", help="(kept for parity)")
-    p_acc.add_argument("--include-depot", action="store_true", help="Include Invest depot account (requires extra auth)")
-    p_acc.add_argument("--portfolio-id", default=None, help="Invest portfolio id (UUID) for depot enrichment")
-    p_acc.add_argument("--depot-account", default="revolut_gia", help="Account id to use for the depot in banker")
     p_acc.set_defaults(func=cmd_accounts)
 
     p_tx = sub.add_parser("transactions", help="Fetch latest transactions from Revolut Web")
     p_tx.add_argument("--account", default=None, help="Account selector")
     p_tx.add_argument("--count", type=int, default=50, help="How many transactions to request")
     p_tx.set_defaults(func=cmd_transactions)
-
-    p_port = sub.add_parser("portfolio", help="Fetch investment portfolio")
-    p_port.add_argument("--id", default=None, help="Portfolio id (UUID) for /trading-access/portfolios/{id}")
-    p_port.add_argument("--account", default=None, help="Account id to store under (e.g. revolut_gia)")
-    p_port.set_defaults(func=cmd_portfolio)
-
-    p_iscan = sub.add_parser("invest-scan", help="Discover Invest API endpoints (prints observed /api/retail URLs)")
-    p_iscan.set_defaults(func=cmd_invest_scan)
-
-    p_itx = sub.add_parser("invest-transactions", help="Fetch investment transactions")
-    p_itx.add_argument("--count", type=int, default=100)
-    p_itx.set_defaults(func=cmd_invest_transactions)
-
-    # Import commands
-    p_imp = sub.add_parser("import", help="Import from Revolut statement files (CSV/PDF)")
-    imp = p_imp.add_subparsers(dest="import_cmd", required=True)
-
-    imp_acc = imp.add_parser("accounts", help="Import accounts snapshot")
-    imp_acc.add_argument("--source", choices=["csv", "pdf"], required=True)
-    imp_acc.add_argument("--file", type=Path, required=True)
-    imp_acc.set_defaults(func=cmd_import_accounts)
-
-    imp_tx = imp.add_parser("transactions", help="Import transactions")
-    imp_tx.add_argument("--source", choices=["csv", "pdf"], required=True)
-    imp_tx.add_argument("--file", type=Path, required=True)
-    imp_tx.add_argument("--account", required=True)
-    imp_tx.add_argument("--from", dest="date_from", required=True)
-    imp_tx.add_argument("--until", dest="date_until", required=True)
-    imp_tx.add_argument("--format", choices=["json"], default="json")
-    imp_tx.add_argument("--out", type=Path, default=TMP_DIR)
-    imp_tx.set_defaults(func=cmd_import_transactions)
 
     args = parser.parse_args()
     return int(args.func(args) or 0)
