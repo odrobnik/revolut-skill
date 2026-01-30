@@ -1138,6 +1138,11 @@ def cmd_portfolio(args) -> int:
                 browser.close()
                 return 3
             time.sleep(2)
+            # Cookie banner sometimes blocks UI / network requests on invest.revolut.com
+            try:
+                page.locator('button:has-text("Allow all cookies"), button:has-text("Accept all cookies"), button:has-text("Accept all")').first.click(timeout=1500)
+            except Exception:
+                pass
         except:  # noqa: E722
             pass
 
@@ -1266,6 +1271,12 @@ def cmd_invest_scan(args) -> int:
                     print("[revolut] Auth not completed.", file=sys.stderr)
                 browser.close()
                 return 3
+
+            # Cookie banner sometimes blocks UI / network requests
+            try:
+                page.locator('button:has-text("Allow all cookies"), button:has-text("Accept all cookies"), button:has-text("Accept all")').first.click(timeout=1500)
+            except Exception:
+                pass
 
             # Trigger more network activity
             try:
