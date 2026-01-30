@@ -1406,15 +1406,24 @@ def cmd_invest_transactions(args) -> int:
     debug = bool(getattr(args, "debug", False))
     headless = not bool(getattr(args, "visible", False))
 
-    # Revolut seems to enforce a relatively small server-side limit. In practice, >100 often fails.
-    limit = int(getattr(args, "count", 100) or 100)
-    if limit > 100:
-        limit = 100
+    # Match George/ELBA UX: explicit date bounds (YYYY-MM-DD).
+    date_from = getattr(args, "date_from", None)
+    date_until = getattr(args, "date_until", None)
+    if not date_from or not date_until:
+        print("[revolut] ERROR: Missing required arguments: --from, --until", file=sys.stderr)
+        return 2
 
-    pages = int(getattr(args, "pages", 1) or 1)
-    from_ms = int(getattr(args, "from_ms", 0) or 0)
-    to_ms_override = getattr(args, "to_ms", None)
-    to_ms_override = int(to_ms_override) if to_ms_override is not None else None
+    # Validate ISO dates
+    import datetime
+    try:
+        datetime.datetime.strptime(date_from, "%Y-%m-%d")
+        datetime.datetime.strptime(date_until, "%Y-%m-%d")
+    except ValueError:
+        print("[revolut] ERROR: Dates must be in YYYY-MM-DD format.", file=sys.stderr)
+        return 2
+
+    # Revolut seems to enforce a relatively small server-side limit. Keep this fixed.
+    limit = 100
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless, slow_mo=50)
@@ -1462,8 +1471,17 @@ def cmd_invest_transactions(args) -> int:
         name_map: dict[str, str] = {}
 
         # Correct trade history endpoint observed in the web client:
-        # https://invest.revolut.com/api/retail/trading/transactions?limit=...&accountType=GIA&to=...&from=...
+        # https://invest.revolut.com/api/retail/trading/transactions?limit=100&accountType=GIA&to=<ms>&from=<ms>
         import datetime
+
+        def _date_to_ms_bounds_utc(d: str):
+            dt0 = datetime.datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
+            start_ms = int(dt0.timestamp() * 1000)
+            end_ms = int((dt0.replace(hour=23, minute=59, second=59, microsecond=999000)).timestamp() * 1000)
+            return start_ms, end_ms
+
+        from_ms, _ = _date_to_ms_bounds_utc(date_from)
+        _, to_ms = _date_to_ms_bounds_utc(date_until)
 
         def _parse_dt_ms(v):
             if v is None:
@@ -1506,14 +1524,13 @@ def cmd_invest_transactions(args) -> int:
                         break
             return mmin
 
-        now = datetime.datetime.now().astimezone()
-        eod = now.replace(hour=23, minute=59, second=59, microsecond=999000)
-        cur_to_ms = to_ms_override if to_ms_override is not None else int(eod.timestamp() * 1000)
-
+        cur_to_ms = to_ms
         all_txs: list[dict] = []
-        last_min_ms = None
+        seen: set[tuple] = set()
 
-        for page_idx in range(max(1, pages)):
+        page_idx = 0
+        while True:
+            page_idx += 1
             url = f"/api/retail/trading/transactions?limit={limit}&accountType=GIA&to={cur_to_ms}&from={from_ms}"
             raw = _fetch_via_api_call(page, url, headers)
 
@@ -1529,27 +1546,52 @@ def cmd_invest_transactions(args) -> int:
                 return 3
 
             if debug:
-                _write_json(state_file.parent / f"revolut_raw_invest_tx_p{page_idx+1}.json", raw)
+                _write_json(state_file.parent / f"revolut_raw_invest_tx_p{page_idx}.json", raw)
 
             txs = canonicalize_revolut_invest_tx(raw, name_map=name_map)
-            all_txs.extend(txs)
+            # de-dupe overlapping pages
+            for tx in txs:
+                key = (
+                    tx.get("bookingDate"),
+                    tx.get("kind"),
+                    (tx.get("security") or {}).get("isin"),
+                    tx.get("quantity"),
+                    (tx.get("price") or {}).get("amount"),
+                    (tx.get("price") or {}).get("currency"),
+                    (tx.get("amount") or {}).get("amount"),
+                    (tx.get("amount") or {}).get("currency"),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                all_txs.append(tx)
 
             items = _extract_items(raw)
+            if not isinstance(items, list) or not items:
+                break
+
             min_ms = _min_item_ms(items)
             if min_ms is None:
                 break
-            if last_min_ms is not None and min_ms >= last_min_ms:
-                break
-            last_min_ms = min_ms
 
-            # paginate: move further into the past
-            cur_to_ms = int(min_ms) - 1
-            if cur_to_ms <= from_ms:
+            # paginate further into the past
+            next_to = int(min_ms) - 1
+            if next_to <= from_ms:
                 break
+            if next_to >= cur_to_ms:
+                break
+            cur_to_ms = next_to
 
             # stop early if fewer than limit returned
-            if isinstance(items, list) and len(items) < limit:
+            if len(items) < limit:
                 break
+
+        wrapper = {
+            "institution": "revolut",
+            "fetchedAt": _now_iso_local(),
+            "range": {"from": date_from, "until": date_until},
+            "transactions": all_txs,
+        }
 
         wrapper = {
             "institution": "revolut",
@@ -1611,10 +1653,8 @@ def main() -> int:
     p_pf.set_defaults(func=cmd_portfolio)
 
     p_itx = sub.add_parser("invest-transactions", help="Fetch Revolut Invest (stocks) transactions")
-    p_itx.add_argument("--count", type=int, default=100, help="How many invest transactions to request (server cap ~100)")
-    p_itx.add_argument("--from-ms", type=int, default=0, help="Lower-bound epoch-ms (optional)")
-    p_itx.add_argument("--to-ms", type=int, default=None, help="Upper-bound epoch-ms (optional)")
-    p_itx.add_argument("--pages", type=int, default=1, help="How many pages to auto-fetch (uses to=oldest-1)")
+    p_itx.add_argument("--from", dest="date_from", required=True, help="Start date (YYYY-MM-DD)")
+    p_itx.add_argument("--until", dest="date_until", required=True, help="End date (YYYY-MM-DD)")
     p_itx.set_defaults(func=cmd_invest_transactions)
 
     p_iscan = sub.add_parser("invest-scan", help="Debug: list observed Revolut Invest /api/retail endpoints")
