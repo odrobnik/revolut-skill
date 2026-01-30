@@ -633,7 +633,16 @@ def _handle_auth_challenge(page, success_url_pattern="**/home**", auth_timeout_m
 
     # Dismiss cookie banner first (might block UI)
     try:
-        page.locator('button:has-text("Accept all cookies"), button:has-text("Allow all cookies"), button:has-text("Accept all")').first.click(timeout=1000)
+        try:
+            page.get_by_role("button", name="Allow all cookies").click(timeout=1000)
+        except Exception:
+            try:
+                page.locator('button.styled__CookieConsentButton-bylcZS:has-text("Allow all cookies")').first.click(timeout=1000)
+            except Exception:
+                try:
+                    page.locator('button:has-text("Allow all cookies"), button:has-text("Accept all cookies"), button:has-text("Accept all")').first.click(timeout=1000)
+                except Exception:
+                    pass
     except:  # noqa: E722
         pass
 
@@ -972,7 +981,16 @@ def _get_api_headers(page, trigger_reload: bool = False) -> dict:
 
     # Cookie banner can block the app from making API calls.
     try:
-        page.locator('button:has-text("Allow all cookies"), button:has-text("Accept all cookies"), button:has-text("Accept all")').first.click(timeout=1000)
+        try:
+            page.get_by_role("button", name="Allow all cookies").click(timeout=1000)
+        except Exception:
+            try:
+                page.locator('button.styled__CookieConsentButton-bylcZS:has-text("Allow all cookies")').first.click(timeout=1000)
+            except Exception:
+                try:
+                    page.locator('button:has-text("Allow all cookies"), button:has-text("Accept all cookies"), button:has-text("Accept all")').first.click(timeout=1000)
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -1168,7 +1186,13 @@ def cmd_portfolio(args) -> int:
             time.sleep(2)
             # Cookie banner sometimes blocks UI / network requests on invest.revolut.com
             try:
-                page.locator('button:has-text("Allow all cookies"), button:has-text("Accept all cookies"), button:has-text("Accept all")').first.click(timeout=1500)
+                try:
+                    page.get_by_role("button", name="Allow all cookies").click(timeout=1500)
+                except Exception:
+                    try:
+                        page.locator('button.styled__CookieConsentButton-bylcZS:has-text("Allow all cookies")').first.click(timeout=1500)
+                    except Exception:
+                        page.locator('button:has-text("Allow all cookies"), button:has-text("Accept all cookies"), button:has-text("Accept all")').first.click(timeout=1500)
             except Exception:
                 pass
         except:  # noqa: E722
@@ -1302,7 +1326,13 @@ def cmd_invest_scan(args) -> int:
 
             # Cookie banner sometimes blocks UI / network requests
             try:
-                page.locator('button:has-text("Allow all cookies"), button:has-text("Accept all cookies"), button:has-text("Accept all")').first.click(timeout=1500)
+                try:
+                    page.get_by_role("button", name="Allow all cookies").click(timeout=1500)
+                except Exception:
+                    try:
+                        page.locator('button.styled__CookieConsentButton-bylcZS:has-text("Allow all cookies")').first.click(timeout=1500)
+                    except Exception:
+                        page.locator('button:has-text("Allow all cookies"), button:has-text("Accept all cookies"), button:has-text("Accept all")').first.click(timeout=1500)
             except Exception:
                 pass
 
@@ -1373,7 +1403,13 @@ def cmd_invest_transactions(args) -> int:
             page.goto("https://invest.revolut.com/activity/transactions", wait_until="domcontentloaded", timeout=15000)
             time.sleep(1)
             try:
-                page.locator('button:has-text("Allow all cookies"), button:has-text("Accept all cookies"), button:has-text("Accept all")').first.click(timeout=1500)
+                try:
+                    page.get_by_role("button", name="Allow all cookies").click(timeout=1500)
+                except Exception:
+                    try:
+                        page.locator('button.styled__CookieConsentButton-bylcZS:has-text("Allow all cookies")').first.click(timeout=1500)
+                    except Exception:
+                        page.locator('button:has-text("Allow all cookies"), button:has-text("Accept all cookies"), button:has-text("Accept all")').first.click(timeout=1500)
             except Exception:
                 pass
         except Exception:
