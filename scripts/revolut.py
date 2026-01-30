@@ -1593,12 +1593,6 @@ def cmd_invest_transactions(args) -> int:
             "transactions": all_txs,
         }
 
-        wrapper = {
-            "institution": "revolut",
-            "fetchedAt": _now_iso_local(),
-            "transactions": all_txs,
-            "paging": {"fromMs": from_ms, "toMs": (to_ms_override if to_ms_override is not None else int(eod.timestamp() * 1000)), "limit": limit, "pages": pages},
-        }
 
         out_path = getattr(args, "out", None)
         if out_path:
