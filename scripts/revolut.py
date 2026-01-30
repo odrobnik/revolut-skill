@@ -638,6 +638,15 @@ def _handle_auth_challenge(page, success_url_pattern="**/home**", auth_timeout_m
     except:  # noqa: E722
         pass
 
+    # Revolut Invest sometimes redirects to a trade view even when fully authenticated.
+    # If caller expects "portfolio" but we landed anywhere on invest.revolut.com, treat as authenticated.
+    try:
+        cur = page.url or ""
+        if "invest.revolut.com" in cur and "portfolio" in (success_url_pattern or ""):
+            return True
+    except Exception:
+        pass
+
     # 2) QR / approval
     try:
         login_url = _try_extract_qr_url(page)
