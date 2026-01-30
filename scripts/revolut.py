@@ -473,7 +473,17 @@ def canonicalize_revolut_invest_tx(payload, name_map: dict | None = None) -> lis
         payload: Raw transaction data from Revolut API
         name_map: Optional dict mapping ref/symbol to stock name (e.g. {"TSLA": "Tesla"})
     """
-    items = payload.get("items", [])
+    # Payload shapes vary. We accept:
+    # - {"items": [...]} (older)
+    # - {"orders": [...]} or similar
+    # - a raw list
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        items = payload.get("items") or payload.get("orders") or payload.get("data") or []
+    else:
+        items = []
+
     out: list[dict] = []
     name_map = name_map or {}
 
@@ -1371,14 +1381,22 @@ def cmd_invest_transactions(args) -> int:
         except Exception:
             pass  # Continue without name enrichment if portfolio fetch fails
 
-        to_ms = int(time.time() * 1000)
-        url = f"/api/retail/trading/transactions?limit={count}&accountType=GIA&accountType=MARGIN&to={to_ms}&from=0"
-        raw = _fetch_via_api_call(page, url, headers)
+        # Revolut Invest trade history endpoint evolves frequently.
+        # As of 2026-01, we observe /api/retail/trading/orders on invest.revolut.com.
+        urls = [
+            f"/api/retail/trading/orders?limit={count}",
+            "/api/retail/trading/orders",
+        ]
+        raw = None
+        for u in urls:
+            raw = _fetch_via_api_call(page, u, headers)
+            if raw is not None:
+                break
 
-        if not raw:
-             print("[revolut] Failed to fetch invest transactions.", file=sys.stderr)
-             browser.close()
-             return 3
+        if raw is None:
+            print("[revolut] Failed to fetch invest transactions.", file=sys.stderr)
+            browser.close()
+            return 3
 
         if debug: _write_json(state_file.parent / "revolut_raw_invest_tx.json", raw)
 
