@@ -1361,7 +1361,7 @@ def cmd_transactions(args) -> int:
                     print("[revolut] JS fetch returned null. Trying interception fallback...", file=sys.stderr)
                     raw_txs = _fetch_via_interception(page, "/api/retail/user/current/transactions/last")
 
-                if not raw_txs:
+                if raw_txs is None or (isinstance(raw_txs, dict) and raw_txs.get("error")):
                     print("[revolut] Failed to fetch transactions.", file=sys.stderr)
                     context.close()
                     return 3
@@ -1406,7 +1406,7 @@ def cmd_transactions(args) -> int:
                 print("[revolut] JS fetch returned null. Trying interception fallback...", file=sys.stderr)
                 raw_txs = _fetch_via_interception(page, "/api/retail/user/current/transactions/last")
 
-            if not raw_txs:
+            if raw_txs is None or (isinstance(raw_txs, dict) and raw_txs.get("error")):
                 print("[revolut] Failed to fetch transactions.", file=sys.stderr)
                 context.close()
                 return 3
