@@ -826,7 +826,7 @@ def cmd_accounts(args) -> int:
             # We need to enter Invest context to access its APIs.
             try:
                 page.goto(INVEST_HOME_URL, wait_until="domcontentloaded", timeout=15000)
-                ok = _handle_auth_challenge(page, success_url_pattern="**/portfolio**")
+                ok = _handle_auth_challenge(page, success_url_pattern="**/trade/**")
                 if not ok:
                     if _LAST_AUTH_EXPIRED:
                         print("QR code expired, please try again", file=sys.stderr)
