@@ -1402,10 +1402,19 @@ def cmd_invest_transactions(args) -> int:
     if not state_file.exists():
         print(f"[revolut] ERROR: No session state found. Run: revolut.py login", file=sys.stderr)
         return 2
-        
+
     debug = bool(getattr(args, "debug", False))
     headless = not bool(getattr(args, "visible", False))
-    count = int(getattr(args, "count", 100) or 100)
+
+    # Revolut seems to enforce a relatively small server-side limit. In practice, >100 often fails.
+    limit = int(getattr(args, "count", 100) or 100)
+    if limit > 100:
+        limit = 100
+
+    pages = int(getattr(args, "pages", 1) or 1)
+    from_ms = int(getattr(args, "from_ms", 0) or 0)
+    to_ms_override = getattr(args, "to_ms", None)
+    to_ms_override = int(to_ms_override) if to_ms_override is not None else None
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless, slow_mo=50)
@@ -1453,33 +1462,100 @@ def cmd_invest_transactions(args) -> int:
         name_map: dict[str, str] = {}
 
         # Correct trade history endpoint observed in the web client:
-        # https://invest.revolut.com/api/retail/trading/transactions?limit=...&accountType=GIA&to=...&from=0
+        # https://invest.revolut.com/api/retail/trading/transactions?limit=...&accountType=GIA&to=...&from=...
         import datetime
+
+        def _parse_dt_ms(v):
+            if v is None:
+                return None
+            if isinstance(v, (int, float)):
+                return int(v)
+            if isinstance(v, str):
+                s = v.strip()
+                if s.endswith("Z"):
+                    s = s[:-1] + "+00:00"
+                try:
+                    dt = datetime.datetime.fromisoformat(s)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=datetime.timezone.utc)
+                    return int(dt.timestamp() * 1000)
+                except Exception:
+                    return None
+            return None
+
+        def _extract_items(payload):
+            if isinstance(payload, list):
+                return payload
+            if isinstance(payload, dict):
+                return payload.get("items") or payload.get("orders") or payload.get("data") or []
+            return []
+
+        def _min_item_ms(items: list):
+            fields = ["completedAt", "createdAt", "executedAt", "updatedAt", "timestamp", "time"]
+            mmin = None
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                for f in fields:
+                    if f in it:
+                        ms = _parse_dt_ms(it.get(f))
+                        if ms is None:
+                            continue
+                        if mmin is None or ms < mmin:
+                            mmin = ms
+                        break
+            return mmin
+
         now = datetime.datetime.now().astimezone()
         eod = now.replace(hour=23, minute=59, second=59, microsecond=999000)
-        to_ms = int(eod.timestamp() * 1000)
-        url = f"/api/retail/trading/transactions?limit={count}&accountType=GIA&to={to_ms}&from=0"
+        cur_to_ms = to_ms_override if to_ms_override is not None else int(eod.timestamp() * 1000)
 
-        raw = _fetch_via_api_call(page, url, headers)
+        all_txs: list[dict] = []
+        last_min_ms = None
 
-        # Fallbacks (endpoint variations)
-        if isinstance(raw, dict) and raw.get("error"):
-            raw = _fetch_via_api_call(page, f"/api/retail/trading/transactions?limit={count}&accountType=GIA&to={to_ms}", headers)
-        if isinstance(raw, dict) and raw.get("error"):
-            raw = _fetch_via_api_call(page, f"/api/retail/trading/transactions?limit={count}&accountType=GIA", headers)
+        for page_idx in range(max(1, pages)):
+            url = f"/api/retail/trading/transactions?limit={limit}&accountType=GIA&to={cur_to_ms}&from={from_ms}"
+            raw = _fetch_via_api_call(page, url, headers)
 
-        if raw is None or (isinstance(raw, dict) and raw.get("error")):
-            print("[revolut] Failed to fetch invest transactions.", file=sys.stderr)
-            browser.close()
-            return 3
+            # Fallbacks (endpoint variations)
+            if isinstance(raw, dict) and raw.get("error"):
+                raw = _fetch_via_api_call(page, f"/api/retail/trading/transactions?limit={limit}&accountType=GIA&to={cur_to_ms}", headers)
+            if isinstance(raw, dict) and raw.get("error"):
+                raw = _fetch_via_api_call(page, f"/api/retail/trading/transactions?limit={limit}&accountType=GIA", headers)
 
-        if debug: _write_json(state_file.parent / "revolut_raw_invest_tx.json", raw)
+            if raw is None or (isinstance(raw, dict) and raw.get("error")):
+                print("[revolut] Failed to fetch invest transactions.", file=sys.stderr)
+                browser.close()
+                return 3
 
-        txs = canonicalize_revolut_invest_tx(raw, name_map=name_map)
+            if debug:
+                _write_json(state_file.parent / f"revolut_raw_invest_tx_p{page_idx+1}.json", raw)
+
+            txs = canonicalize_revolut_invest_tx(raw, name_map=name_map)
+            all_txs.extend(txs)
+
+            items = _extract_items(raw)
+            min_ms = _min_item_ms(items)
+            if min_ms is None:
+                break
+            if last_min_ms is not None and min_ms >= last_min_ms:
+                break
+            last_min_ms = min_ms
+
+            # paginate: move further into the past
+            cur_to_ms = int(min_ms) - 1
+            if cur_to_ms <= from_ms:
+                break
+
+            # stop early if fewer than limit returned
+            if isinstance(items, list) and len(items) < limit:
+                break
+
         wrapper = {
             "institution": "revolut",
             "fetchedAt": _now_iso_local(),
-            "transactions": txs
+            "transactions": all_txs,
+            "paging": {"fromMs": from_ms, "toMs": (to_ms_override if to_ms_override is not None else int(eod.timestamp() * 1000)), "limit": limit, "pages": pages},
         }
 
         out_path = getattr(args, "out", None)
@@ -1535,7 +1611,10 @@ def main() -> int:
     p_pf.set_defaults(func=cmd_portfolio)
 
     p_itx = sub.add_parser("invest-transactions", help="Fetch Revolut Invest (stocks) transactions")
-    p_itx.add_argument("--count", type=int, default=200, help="How many invest transactions to request")
+    p_itx.add_argument("--count", type=int, default=100, help="How many invest transactions to request (server cap ~100)")
+    p_itx.add_argument("--from-ms", type=int, default=0, help="Lower-bound epoch-ms (optional)")
+    p_itx.add_argument("--to-ms", type=int, default=None, help="Upper-bound epoch-ms (optional)")
+    p_itx.add_argument("--pages", type=int, default=1, help="How many pages to auto-fetch (uses to=oldest-1)")
     p_itx.set_defaults(func=cmd_invest_transactions)
 
     p_iscan = sub.add_parser("invest-scan", help="Debug: list observed Revolut Invest /api/retail endpoints")
