@@ -657,6 +657,14 @@ def _handle_auth_challenge(page, success_url_pattern="**/home**", auth_timeout_m
     except:  # noqa: E722
         pass
 
+    # Sometimes we are already on the right screen but Playwright URL-pattern matching can miss fast redirects.
+    try:
+        cur = page.url or ""
+        if ("/trade/" in cur and "trade" in (success_url_pattern or "")) or ("/activity/transactions" in cur):
+            return True
+    except Exception:
+        pass
+
     # 2) QR / approval
     try:
         login_url = _try_extract_qr_url(page)
@@ -690,6 +698,12 @@ def _handle_auth_challenge(page, success_url_pattern="**/home**", auth_timeout_m
         # We poll so we can detect "QR code expired".
         deadline = time.time() + (auth_timeout_ms / 1000.0)
         while time.time() < deadline:
+            # Dismiss cookie banner (can appear after redirect)
+            try:
+                page.get_by_role("button", name="Allow all cookies").click(timeout=200)
+            except Exception:
+                pass
+
             try:
                 body = (page.inner_text("body") or "").lower()
                 if "qr code expired" in body:
@@ -704,6 +718,16 @@ def _handle_auth_challenge(page, success_url_pattern="**/home**", auth_timeout_m
                 print("[revolut] Login confirmed.", file=sys.stderr)
                 return True
             except PlaywrightTimeout:
+                pass
+
+
+            # Fast path: check current URL (handles quick redirects that we might miss).
+            try:
+                cur = page.url or ""
+                if ("/trade/" in cur and "trade" in (success_url_pattern or "")) or ("/activity/transactions" in cur):
+                    print("[revolut] Login confirmed.", file=sys.stderr)
+                    return True
+            except Exception:
                 pass
             except:  # noqa: E722
                 # likely target closed
