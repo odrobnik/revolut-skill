@@ -1342,8 +1342,8 @@ def cmd_transactions(args) -> int:
             else:
                 print(f"[revolut] Warning: Account ID '{account_id}' does not look like a UUID. API might ignore it or fail.", file=sys.stderr)
 
-        # Capture headers from environment
-        api_headers = _get_api_headers(page)
+        # Capture headers from environment. Trigger a reload to ensure we sniff x-device-id etc.
+        api_headers = _get_api_headers(page, trigger_reload=True)
 
         all_raw_items: list[dict] = []
         seen_keys: set[tuple] = set()
