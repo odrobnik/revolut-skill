@@ -1354,8 +1354,12 @@ def cmd_invest_transactions(args) -> int:
         except:  # noqa: E722
             pass
         
-        # Navigate to the transactions activity page first so the request origin/referrer matches
-        # what the web client uses (and so background requests populate auth headers).
+        # Capture auth headers from the initial Invest app load (it emits /api/retail calls that
+        # include x-device-id, x-browser-application, x-client-version, etc.).
+        headers = _get_api_headers(page)
+
+        # Navigate to the transactions activity page so the request origin/referrer matches
+        # what the web client uses.
         try:
             page.goto("https://invest.revolut.com/activity/transactions", wait_until="domcontentloaded", timeout=15000)
             time.sleep(1)
@@ -1365,8 +1369,6 @@ def cmd_invest_transactions(args) -> int:
                 pass
         except Exception:
             pass
-
-        headers = _get_api_headers(page)
 
         # Optional name enrichment (best-effort; may fail when Revolut changes endpoints)
         name_map: dict[str, str] = {}
