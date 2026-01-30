@@ -1037,120 +1037,120 @@ def cmd_accounts(args) -> int:
 
         accounts = canonicalize_revolut_accounts(raw)
 
-        # Optional: include Invest depot summary as a synthetic "depot" account.
-        if bool(getattr(args, "include_depot", False)):
-            portfolio_id = getattr(args, "portfolio_id", None)
-            depot_account_id = getattr(args, "depot_account", "revolut_gia")
+        # Always include Invest depot summary as a synthetic "depot" account.
+        # (Oliver preference: no flag; accounts should always show depot.)
+        portfolio_id = getattr(args, "portfolio_id", None)
+        depot_account_id = getattr(args, "depot_account", "revolut_gia")
 
-            # We need to enter Invest context to access its APIs.
-            try:
-                page.goto(INVEST_HOME_URL, wait_until="domcontentloaded", timeout=15000)
-                ok = _handle_auth_challenge(page, success_url_pattern="**/trade/**")
-                if not ok:
-                    if _LAST_AUTH_EXPIRED:
-                        print("QR code expired, please try again", file=sys.stderr)
-                    else:
-                        print("[revolut] Auth not completed.", file=sys.stderr)
-                    context.close()
-                    return 3
-                time.sleep(1)
+        # We need to enter Invest context to access its APIs.
+        try:
+            page.goto(INVEST_HOME_URL, wait_until="domcontentloaded", timeout=15000)
+            ok = _handle_auth_challenge(page, success_url_pattern="**/trade/**")
+            if not ok:
+                if _LAST_AUTH_EXPIRED:
+                    print("QR code expired, please try again", file=sys.stderr)
+                else:
+                    print("[revolut] Auth not completed.", file=sys.stderr)
+                context.close()
+                return 3
+            time.sleep(1)
 
-                invest_headers = _get_api_headers(page)
+            invest_headers = _get_api_headers(page)
 
-                # Determine portfolio id if not provided.
-                pid = portfolio_id
-                if not pid:
-                    raw_list = _fetch_via_api_call(page, "/api/retail/trading-access/portfolios", invest_headers)
-                    if isinstance(raw_list, list):
-                        for p0 in raw_list:
-                            if isinstance(p0, dict) and p0.get("state") == "ACTIVE" and p0.get("accountType") == "GIA":
-                                pid = p0.get("id")
-                                break
+            # Determine portfolio id if not provided.
+            pid = portfolio_id
+            if not pid:
+                raw_list = _fetch_via_api_call(page, "/api/retail/trading-access/portfolios", invest_headers)
+                if isinstance(raw_list, list):
+                    for p0 in raw_list:
+                        if isinstance(p0, dict) and p0.get("state") == "ACTIVE" and p0.get("accountType") == "GIA":
+                            pid = p0.get("id")
+                            break
 
-                depot_currency = "USD"
-                depot_value = None
-                depot_pl = None
-                depot_pct = None
+            depot_currency = "USD"
+            depot_value = None
+            depot_pl = None
+            depot_pct = None
 
-                if pid and isinstance(pid, str):
-                    raw_pf = _fetch_via_api_call(page, f"/api/retail/trading-access/portfolios/{pid}", invest_headers)
-                    tickers_by_ref = {}
-                    holdings = raw_pf.get("holdings", []) if isinstance(raw_pf, dict) else []
-                    refs = []
-                    if isinstance(holdings, list):
-                        for h in holdings:
-                            if isinstance(h, dict) and h.get("assetType") != "CASH":
-                                r = h.get("ref") or h.get("id")
-                                if isinstance(r, str) and r:
-                                    refs.append(r)
-                    refs = sorted(set(refs))
-                    if refs:
-                        tickers = _fetch_via_api_call(page, "/api/retail/instruments/tickers", invest_headers, method="POST", body=refs)
-                        if isinstance(tickers, list):
-                            for t in tickers:
-                                if isinstance(t, dict) and isinstance(t.get("ref"), str):
-                                    tickers_by_ref[t["ref"]] = t
+            if pid and isinstance(pid, str):
+                raw_pf = _fetch_via_api_call(page, f"/api/retail/trading-access/portfolios/{pid}", invest_headers)
+                tickers_by_ref = {}
+                holdings = raw_pf.get("holdings", []) if isinstance(raw_pf, dict) else []
+                refs = []
+                if isinstance(holdings, list):
+                    for h in holdings:
+                        if isinstance(h, dict) and h.get("assetType") != "CASH":
+                            r = h.get("ref") or h.get("id")
+                            if isinstance(r, str) and r:
+                                refs.append(r)
+                refs = sorted(set(refs))
+                if refs:
+                    tickers = _fetch_via_api_call(page, "/api/retail/instruments/tickers", invest_headers, method="POST", body=refs)
+                    if isinstance(tickers, list):
+                        for t in tickers:
+                            if isinstance(t, dict) and isinstance(t.get("ref"), str):
+                                tickers_by_ref[t["ref"]] = t
 
-                    canon_pf = canonicalize_revolut_portfolio(raw_pf, tickers_by_ref=tickers_by_ref)
-                    positions = canon_pf.get("positions", [])
+                canon_pf = canonicalize_revolut_portfolio(raw_pf, tickers_by_ref=tickers_by_ref)
+                positions = canon_pf.get("positions", [])
 
-                    # Compute totals
-                    total_mv = 0.0
-                    total_pl = 0.0
-                    total_cost = 0.0
-                    for pos in positions:
-                        if not isinstance(pos, dict):
-                            continue
-                        mv = pos.get("marketValue") if isinstance(pos.get("marketValue"), dict) else None
-                        perf = pos.get("performance") if isinstance(pos.get("performance"), dict) else None
-                        avg = pos.get("averagePrice") if isinstance(pos.get("averagePrice"), dict) else None
-                        qty = pos.get("quantity")
+                # Compute totals
+                total_mv = 0.0
+                total_pl = 0.0
+                total_cost = 0.0
+                for pos in positions:
+                    if not isinstance(pos, dict):
+                        continue
+                    mv = pos.get("marketValue") if isinstance(pos.get("marketValue"), dict) else None
+                    perf = pos.get("performance") if isinstance(pos.get("performance"), dict) else None
+                    avg = pos.get("averagePrice") if isinstance(pos.get("averagePrice"), dict) else None
+                    qty = pos.get("quantity")
+                    try:
+                        q = float(qty) if qty is not None else 0.0
+                    except Exception:
+                        q = 0.0
+                    if isinstance(mv, dict) and mv.get("amount") is not None:
                         try:
-                            q = float(qty) if qty is not None else 0.0
+                            total_mv += float(mv.get("amount"))
                         except Exception:
-                            q = 0.0
-                        if isinstance(mv, dict) and mv.get("amount") is not None:
+                            pass
+                        depot_currency = mv.get("currency") or depot_currency
+                    if isinstance(perf, dict):
+                        abs_ = perf.get("absolute") if isinstance(perf.get("absolute"), dict) else None
+                        if isinstance(abs_, dict) and abs_.get("amount") is not None:
                             try:
-                                total_mv += float(mv.get("amount"))
+                                total_pl += float(abs_.get("amount"))
                             except Exception:
                                 pass
-                            depot_currency = mv.get("currency") or depot_currency
-                        if isinstance(perf, dict):
-                            abs_ = perf.get("absolute") if isinstance(perf.get("absolute"), dict) else None
-                            if isinstance(abs_, dict) and abs_.get("amount") is not None:
-                                try:
-                                    total_pl += float(abs_.get("amount"))
-                                except Exception:
-                                    pass
-                        if isinstance(avg, dict) and avg.get("amount") is not None:
-                            try:
-                                total_cost += float(avg.get("amount")) * q
-                            except Exception:
-                                pass
+                    if isinstance(avg, dict) and avg.get("amount") is not None:
+                        try:
+                            total_cost += float(avg.get("amount")) * q
+                        except Exception:
+                            pass
 
-                    depot_value = total_mv
-                    depot_pl = total_pl
-                    if total_cost:
-                        depot_pct = (total_pl / total_cost) * 100.0
+                depot_value = total_mv
+                depot_pl = total_pl
+                if total_cost:
+                    depot_pct = (total_pl / total_cost) * 100.0
 
-                depot_acct = {
-                    "id": depot_account_id,
-                    "type": "depot",
-                    "name": "Revolut Invest (GIA)",
-                    "currency": depot_currency,
+            depot_acct = {
+                "id": depot_account_id,
+                "type": "depot",
+                "name": "Revolut Invest (GIA)",
+                "currency": depot_currency,
+            }
+            if depot_value is not None or depot_pl is not None:
+                depot_acct["securities"] = {
+                    "value": {"amount": depot_value, "currency": depot_currency},
+                    "profitLoss": {"amount": depot_pl, "currency": depot_currency, "percent": depot_pct},
                 }
-                if depot_value is not None or depot_pl is not None:
-                    depot_acct["securities"] = {
-                        "value": {"amount": depot_value, "currency": depot_currency},
-                        "profitLoss": {"amount": depot_pl, "currency": depot_currency, "percent": depot_pct},
-                    }
 
-                # Replace existing synthetic depot entry if present
-                accounts = [a for a in accounts if a.get("id") != depot_account_id]
-                accounts.append(depot_acct)
+            # Replace existing synthetic depot entry if present
+            accounts = [a for a in accounts if a.get("id") != depot_account_id]
+            accounts.append(depot_acct)
 
-            except Exception as e:
-                print(f"[revolut] Failed to include depot: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"[revolut] Failed to include depot: {e}", file=sys.stderr)
 
         wrapper: dict[str, Any] = {
             "institution": "revolut",
@@ -1896,9 +1896,8 @@ def main() -> int:
     p_logout = sub.add_parser("logout", help="Delete storage state")
     p_logout.set_defaults(func=cmd_logout)
 
-    p_acc = sub.add_parser("accounts", help="Fetch accounts (wallets) from Revolut Web")
+    p_acc = sub.add_parser("accounts", help="Fetch accounts (wallets + Invest depot) from Revolut Web")
     p_acc.add_argument("--json", action="store_true", help="(kept for parity)")
-    p_acc.add_argument("--include-depot", action="store_true", help="Also include Revolut Invest (GIA) as a synthetic depot account")
     p_acc.add_argument("--portfolio-id", default=None, help="Optional portfolio id (if you want to force a specific Invest portfolio)")
     p_acc.add_argument("--depot-account", default="revolut_gia", help="Account id to use for the synthetic depot entry (default: revolut_gia)")
     p_acc.set_defaults(func=cmd_accounts)
