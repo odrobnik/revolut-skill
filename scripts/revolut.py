@@ -21,6 +21,7 @@ import json
 import os
 import re
 import subprocess
+import shutil
 import time
 import random
 from dataclasses import dataclass
@@ -49,6 +50,123 @@ _TMP_ROOT = Path(os.environ.get("MOLTBOT_TMP", "/tmp")).expanduser().resolve()
 TMP_DIR = _TMP_ROOT / "moltbot" / "revolut"
 
 DEFAULT_STATE_FILE = WORKSPACE_DIR / "revolut_state.json"
+
+
+def _profile_dir_from_args(args) -> Path:
+    val = getattr(args, "profile_dir", None)
+    if val:
+        return Path(val).expanduser().resolve()
+
+    # Default: a stable persistent profile alongside the state file.
+    # This keeps Revolut sessions stable across commands.
+    state = _state_file_from_args(args)
+    base = state.parent
+    name = f".pw-{state.stem}-profile"
+    return (base / name).expanduser().resolve()
+
+
+def _load_storage_state(path: Path) -> dict | None:
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return None
+
+
+def _apply_storage_state_to_context(context, payload: dict) -> None:
+    """Best-effort import of Playwright storage_state into a persistent context.
+
+    Persistent contexts can't be created *from* storage_state directly.
+    But we can:
+    - add cookies
+    - add an init script that restores localStorage per-origin
+
+    This is good enough to avoid repeated step-up auth in many cases.
+    """
+    if not isinstance(payload, dict):
+        return
+
+    cookies = payload.get("cookies")
+    if isinstance(cookies, list) and cookies:
+        try:
+            context.add_cookies(cookies)
+        except Exception:
+            pass
+
+    origins = payload.get("origins")
+    if not isinstance(origins, list) or not origins:
+        return
+
+    mapping = {}
+    for o in origins:
+        if not isinstance(o, dict):
+            continue
+        origin = o.get("origin")
+        ls = o.get("localStorage")
+        if not isinstance(origin, str) or not isinstance(ls, list):
+            continue
+        kv = {}
+        for item in ls:
+            if isinstance(item, dict) and isinstance(item.get("name"), str):
+                kv[item["name"]] = str(item.get("value") or "")
+        if kv:
+            mapping[origin] = kv
+
+    if not mapping:
+        return
+
+    # Restore localStorage for matching origin on each document.
+    script = """
+(() => {
+  try {
+    const m = %s;
+    const origin = window.location.origin;
+    const kv = m[origin];
+    if (kv) {
+      for (const [k, v] of Object.entries(kv)) {
+        try { window.localStorage.setItem(k, v); } catch (e) {}
+      }
+    }
+  } catch (e) {}
+})();
+""" % json.dumps(mapping)
+
+    try:
+        context.add_init_script(script)
+    except Exception:
+        pass
+
+
+def _profile_is_empty(profile_dir: Path) -> bool:
+    try:
+        if not profile_dir.exists():
+            return True
+        # Chromium profile dirs have lots of files; if empty, consider it uninitialized.
+        return not any(profile_dir.iterdir())
+    except Exception:
+        return True
+
+
+def _launch_persistent_context(p, args, headless: bool):
+    state_file = _state_file_from_args(args)
+    profile_dir = _profile_dir_from_args(args)
+    _ensure_dir(profile_dir)
+
+    context = p.chromium.launch_persistent_context(
+        user_data_dir=str(profile_dir),
+        headless=headless,
+        viewport={"width": 1280, "height": 800},
+        user_agent=DEFAULT_UA,
+    )
+
+    # If profile is empty but we have a legacy state file, import it once.
+    if _profile_is_empty(profile_dir) and state_file.exists():
+        payload = _load_storage_state(state_file)
+        if payload:
+            _apply_storage_state_to_context(context, payload)
+
+    return context
 
 REVOLUT_BASE_URL = "https://app.revolut.com"
 REVOLUT_HOME_URL = f"{REVOLUT_BASE_URL}/home"
@@ -762,64 +880,76 @@ def cmd_login(args) -> int:
     _ensure_dir(state_file.parent)
 
     with sync_playwright() as p:  # type: ignore[misc]
-        # Reuse state if exists to avoid full re-auth if possible
-        if state_file.exists():
-             context = p.chromium.launch(headless=False, slow_mo=50).new_context(
-                storage_state=str(state_file),
-                viewport={"width": 1280, "height": 800},
-                user_agent=DEFAULT_UA
-             )
-        else:
-             context = p.chromium.launch(headless=False, slow_mo=50).new_context(
-                viewport={"width": 1280, "height": 800},
-                user_agent=DEFAULT_UA
-             )
-             
+        # Persistent profile keeps Revolut session stable across commands.
+        context = _launch_persistent_context(p, args, headless=False)
         page = context.new_page()
-        page.goto(REVOLUT_START_URL, wait_until="domcontentloaded")
-        time.sleep(2) # Wait for redirect or load
-        
-        if _handle_auth_challenge(page):
-            # Verify we are actually logged in?
+
+        try:
+            page.goto(REVOLUT_HOME_URL, wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            pass
+
+        ok = _handle_auth_challenge(page, success_url_pattern="**/home**")
+        if not ok:
+            if _LAST_AUTH_EXPIRED:
+                print("QR code expired, please try again", file=sys.stderr)
+            else:
+                print("[revolut] Auth not completed.", file=sys.stderr)
             try:
-                page.wait_for_url("**/home**", timeout=5000)
-                context.storage_state(path=str(state_file))
-                print(f"[revolut] Login successful. State saved to: {state_file}")
-                return 0
-            except:
-                print("[revolut] Login flow finished but did not reach Home. Check manual intervention.", file=sys.stderr)
-                return 1
-        return 1
+                context.close()
+            except Exception:
+                pass
+            return 3
+
+        time.sleep(2)
+        try:
+            context.storage_state(path=str(state_file))
+            print(f"[revolut] Login successful. State saved to: {state_file}", file=sys.stderr)
+        except Exception as e:
+            print(f"[revolut] WARNING: could not save storage state: {e}", file=sys.stderr)
+
+        try:
+            context.close()
+        except Exception:
+            pass
+
+    return 0
 
 
 def cmd_logout(args) -> int:
     state_file = _state_file_from_args(args)
-    if state_file.exists():
-        state_file.unlink()
-        print(f"[revolut] Deleted state: {state_file}")
-    else:
-        print(f"[revolut] No state file found at: {state_file}")
+    profile_dir = _profile_dir_from_args(args)
+
+    try:
+        if state_file.exists():
+            state_file.unlink()
+            print(f"[revolut] Deleted state: {state_file}", file=sys.stderr)
+    except Exception as e:
+        print(f"[revolut] Failed to delete state: {e}", file=sys.stderr)
+
+    try:
+        if profile_dir.exists():
+            shutil.rmtree(profile_dir)
+            print(f"[revolut] Deleted profile dir: {profile_dir}", file=sys.stderr)
+    except Exception as e:
+        print(f"[revolut] Failed to delete profile dir: {e}", file=sys.stderr)
+
     return 0
 
 
 def cmd_accounts(args) -> int:
     _require_playwright()
     state_file = _state_file_from_args(args)
-    if not state_file.exists():
-        print(f"[revolut] ERROR: No session state found. Run: revolut.py login", file=sys.stderr)
+    profile_dir = _profile_dir_from_args(args)
+    if (not state_file.exists()) and (not profile_dir.exists()):
+        print(f"[revolut] ERROR: No session found. Run: revolut.py login", file=sys.stderr)
         return 2
 
     debug = bool(getattr(args, "debug", False))
     headless = not bool(getattr(args, "visible", False))
 
     with sync_playwright() as p:  # type: ignore[misc]
-        # Always visible for now to pass Cloudflare/Auth
-        browser = p.chromium.launch(headless=headless, slow_mo=50)
-        context = browser.new_context(
-            storage_state=str(state_file),
-            viewport={"width": 1280, "height": 800},
-            user_agent=DEFAULT_UA,
-        )
+        context = _launch_persistent_context(p, args, headless=headless)
         page = context.new_page()
 
         # Check for passcode/QR if redirected to login
@@ -831,7 +961,7 @@ def cmd_accounts(args) -> int:
                     print("QR code expired, please try again", file=sys.stderr)
                 else:
                     print("[revolut] Auth not completed.", file=sys.stderr)
-                browser.close()
+                context.close()
                 return 3
             time.sleep(2)
         except Exception:
@@ -852,7 +982,7 @@ def cmd_accounts(args) -> int:
                     page.screenshot(path=str(state_file.parent / "revolut_debug_fetch.png"))
                 except Exception:
                     pass
-            browser.close()
+            context.close()
             return 3
 
         if debug:
@@ -874,7 +1004,7 @@ def cmd_accounts(args) -> int:
                         print("QR code expired, please try again", file=sys.stderr)
                     else:
                         print("[revolut] Auth not completed.", file=sys.stderr)
-                    browser.close()
+                    context.close()
                     return 3
                 time.sleep(1)
 
@@ -990,7 +1120,7 @@ def cmd_accounts(args) -> int:
             print(f"[revolut] Wrote JSON: {out_path}", file=sys.stderr)
         else:
             print(json.dumps(wrapper, ensure_ascii=False, indent=2))
-        browser.close()
+        context.close()
         return 0
 
 
@@ -1100,30 +1230,27 @@ def _fetch_via_api_call(page, url: str, extra_headers: dict = {}, method: str = 
 def cmd_transactions(args) -> int:
     _require_playwright()
     state_file = _state_file_from_args(args)
-    if not state_file.exists():
-        print(f"[revolut] ERROR: No session state found. Run: revolut.py login", file=sys.stderr)
+    profile_dir = _profile_dir_from_args(args)
+    if (not state_file.exists()) and (not profile_dir.exists()):
+        print(f"[revolut] ERROR: No session found. Run: revolut.py login", file=sys.stderr)
         return 2
 
     debug = bool(getattr(args, "debug", False))
     headless = not bool(getattr(args, "visible", False))
-    count = int(getattr(args, "count", 50) or 50)
+    # Revolut wallet endpoint can become flaky with very large counts. Keep it fixed.
+    count = 100
     account_id = getattr(args, "account", None)
 
     with sync_playwright() as p:  # type: ignore[misc]
-        browser = p.chromium.launch(headless=headless, slow_mo=50)
-        context = browser.new_context(
-            storage_state=str(state_file),
-            viewport={"width": 1280, "height": 800},
-            user_agent=DEFAULT_UA,
-        )
+        context = _launch_persistent_context(p, args, headless=headless)
         page = context.new_page()
-        
+
         try:
-            page.goto(REVOLUT_HOME_URL, wait_until="domcontentloaded", timeout=15000)
-            _handle_auth_challenge(page)
-            # Wait a bit for auth/cookies to settle
-            time.sleep(2)
-        except: pass
+            page.goto(REVOLUT_HOME_URL, wait_until="domcontentloaded", timeout=30000)
+            _handle_auth_challenge(page, success_url_pattern="**/home**")
+            time.sleep(1)
+        except Exception:
+            pass
 
         # Construct API URL
         # Default: last transactions (mixed)
@@ -1155,7 +1282,7 @@ def cmd_transactions(args) -> int:
         
         if not raw_txs:
              print("[revolut] Failed to fetch transactions.", file=sys.stderr)
-             browser.close()
+             context.close()
              return 3
 
         if debug:
@@ -1181,15 +1308,16 @@ def cmd_transactions(args) -> int:
             print(f"[revolut] Wrote JSON: {out_path}", file=sys.stderr)
         else:
             print(json.dumps(wrapper, ensure_ascii=False, indent=2))
-        browser.close()
+        context.close()
         return 0
 
 
 def cmd_portfolio(args) -> int:
     _require_playwright()
     state_file = _state_file_from_args(args)
-    if not state_file.exists():
-        print(f"[revolut] ERROR: No session state found. Run: revolut.py login", file=sys.stderr)
+    profile_dir = _profile_dir_from_args(args)
+    if (not state_file.exists()) and (not profile_dir.exists()):
+        print(f"[revolut] ERROR: No session found. Run: revolut.py login", file=sys.stderr)
         return 2
 
     debug = bool(getattr(args, "debug", False))
@@ -1198,12 +1326,7 @@ def cmd_portfolio(args) -> int:
     account_id = getattr(args, "account", None)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless, slow_mo=50)
-        context = browser.new_context(
-            storage_state=str(state_file),
-            viewport={"width": 1280, "height": 800},
-            user_agent=DEFAULT_UA,
-        )
+        context = _launch_persistent_context(p, args, headless=headless)
         page = context.new_page()
 
         try:
@@ -1214,7 +1337,7 @@ def cmd_portfolio(args) -> int:
                     print("QR code expired, please try again", file=sys.stderr)
                 else:
                     print("[revolut] Auth not completed.", file=sys.stderr)
-                browser.close()
+                context.close()
                 return 3
             time.sleep(2)
             # Cookie banner sometimes blocks UI / network requests on invest.revolut.com
@@ -1260,7 +1383,7 @@ def cmd_portfolio(args) -> int:
 
         if not raw:
             print("[revolut] Failed to fetch portfolio.", file=sys.stderr)
-            browser.close()
+            context.close()
             return 3
 
         if debug:
@@ -1309,7 +1432,7 @@ def cmd_portfolio(args) -> int:
             print(f"[revolut] Wrote JSON: {out_path}", file=sys.stderr)
         else:
             print(json.dumps(wrapper, ensure_ascii=False, indent=2))
-        browser.close()
+        context.close()
         return 0
 
 def cmd_invest_scan(args) -> int:
@@ -1319,19 +1442,15 @@ def cmd_invest_scan(args) -> int:
     """
     _require_playwright()
     state_file = _state_file_from_args(args)
-    if not state_file.exists():
-        print(f"[revolut] ERROR: No session state found. Run: revolut.py login", file=sys.stderr)
+    profile_dir = _profile_dir_from_args(args)
+    if (not state_file.exists()) and (not profile_dir.exists()):
+        print(f"[revolut] ERROR: No session found. Run: revolut.py login", file=sys.stderr)
         return 2
 
     headless = not bool(getattr(args, "visible", False))
 
     with sync_playwright() as p:  # type: ignore[misc]
-        browser = p.chromium.launch(headless=headless, slow_mo=50)
-        context = browser.new_context(
-            storage_state=str(state_file),
-            viewport={"width": 1280, "height": 800},
-            user_agent=DEFAULT_UA,
-        )
+        context = _launch_persistent_context(p, args, headless=headless)
         page = context.new_page()
 
         urls: set[str] = set()
@@ -1354,7 +1473,7 @@ def cmd_invest_scan(args) -> int:
                     print("QR code expired, please try again", file=sys.stderr)
                 else:
                     print("[revolut] Auth not completed.", file=sys.stderr)
-                browser.close()
+                context.close()
                 return 3
 
             # Cookie banner sometimes blocks UI / network requests
@@ -1378,7 +1497,7 @@ def cmd_invest_scan(args) -> int:
 
         except Exception as e:
             print(f"[revolut] invest-scan failed: {e}", file=sys.stderr)
-            browser.close()
+            context.close()
             return 3
 
         payload = {"observed": len(urls), "urls": sorted(urls)}
@@ -1392,15 +1511,16 @@ def cmd_invest_scan(args) -> int:
             print(f"[revolut] Wrote JSON: {out_path}", file=sys.stderr)
         else:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
-        browser.close()
+        context.close()
         return 0
 
 
 def cmd_invest_transactions(args) -> int:
     _require_playwright()
     state_file = _state_file_from_args(args)
-    if not state_file.exists():
-        print(f"[revolut] ERROR: No session state found. Run: revolut.py login", file=sys.stderr)
+    profile_dir = _profile_dir_from_args(args)
+    if (not state_file.exists()) and (not profile_dir.exists()):
+        print(f"[revolut] ERROR: No session found. Run: revolut.py login", file=sys.stderr)
         return 2
 
     debug = bool(getattr(args, "debug", False))
@@ -1426,8 +1546,7 @@ def cmd_invest_transactions(args) -> int:
     limit = 100
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless, slow_mo=50)
-        context = browser.new_context(storage_state=str(state_file), viewport={"width": 1280, "height": 800}, user_agent=DEFAULT_UA)
+        context = _launch_persistent_context(p, args, headless=headless)
         page = context.new_page()
         
         try:
@@ -1439,7 +1558,7 @@ def cmd_invest_transactions(args) -> int:
                     print("QR code expired, please try again", file=sys.stderr)
                 else:
                     print("[revolut] Auth not completed.", file=sys.stderr)
-                browser.close()
+                context.close()
                 return 3
             time.sleep(2)
         except:  # noqa: E722
@@ -1542,7 +1661,7 @@ def cmd_invest_transactions(args) -> int:
 
             if raw is None or (isinstance(raw, dict) and raw.get("error")):
                 print("[revolut] Failed to fetch invest transactions.", file=sys.stderr)
-                browser.close()
+                context.close()
                 return 3
 
             if debug:
@@ -1603,7 +1722,7 @@ def cmd_invest_transactions(args) -> int:
             print(f"[revolut] Wrote JSON: {out_path}", file=sys.stderr)
         else:
             print(json.dumps(wrapper, ensure_ascii=False, indent=2))
-        browser.close()
+        context.close()
         return 0
 
 
@@ -1623,6 +1742,7 @@ def main() -> int:
     parser.add_argument("--state", default=None, help=f"Path to storage state (default: {DEFAULT_STATE_FILE})")
     parser.add_argument("--debug", action="store_true", help="Save raw Revolut payloads")
     parser.add_argument("--out", default=None, help="Write JSON output to file (so STDOUT can be used for QR prompts)")
+    parser.add_argument("--profile-dir", default=None, help="Chromium user data dir for persistent sessions (default: alongside state file)")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1636,9 +1756,8 @@ def main() -> int:
     p_acc.add_argument("--json", action="store_true", help="(kept for parity)")
     p_acc.set_defaults(func=cmd_accounts)
 
-    p_tx = sub.add_parser("transactions", help="Fetch latest wallet transactions from Revolut Web")
+    p_tx = sub.add_parser("transactions", help="Fetch wallet transactions from Revolut Web")
     p_tx.add_argument("--account", default=None, help="Account selector")
-    p_tx.add_argument("--count", type=int, default=50, help="How many transactions to request")
     p_tx.set_defaults(func=cmd_transactions)
 
     p_pf = sub.add_parser("portfolio", help="Fetch Revolut Invest (stocks) portfolio holdings")
