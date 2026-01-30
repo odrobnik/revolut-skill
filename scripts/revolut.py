@@ -1411,10 +1411,22 @@ def main() -> int:
     p_acc.add_argument("--json", action="store_true", help="(kept for parity)")
     p_acc.set_defaults(func=cmd_accounts)
 
-    p_tx = sub.add_parser("transactions", help="Fetch latest transactions from Revolut Web")
+    p_tx = sub.add_parser("transactions", help="Fetch latest wallet transactions from Revolut Web")
     p_tx.add_argument("--account", default=None, help="Account selector")
     p_tx.add_argument("--count", type=int, default=50, help="How many transactions to request")
     p_tx.set_defaults(func=cmd_transactions)
+
+    p_pf = sub.add_parser("portfolio", help="Fetch Revolut Invest (stocks) portfolio holdings")
+    p_pf.add_argument("--id", default=None, help="Portfolio id (optional; auto-pick if omitted)")
+    p_pf.add_argument("--account", default=None, help="Optional account id label for output")
+    p_pf.set_defaults(func=cmd_portfolio)
+
+    p_itx = sub.add_parser("invest-transactions", help="Fetch Revolut Invest (stocks) transactions")
+    p_itx.add_argument("--count", type=int, default=200, help="How many invest transactions to request")
+    p_itx.set_defaults(func=cmd_invest_transactions)
+
+    p_iscan = sub.add_parser("invest-scan", help="Debug: list observed Revolut Invest /api/retail endpoints")
+    p_iscan.set_defaults(func=cmd_invest_scan)
 
     args = parser.parse_args()
     return int(args.func(args) or 0)
