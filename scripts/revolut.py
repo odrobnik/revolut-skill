@@ -623,7 +623,7 @@ def _handle_auth_challenge(page, success_url_pattern="**/home**", auth_timeout_m
 
     # Dismiss cookie banner first (might block UI)
     try:
-        page.locator('button:has-text("Accept all cookies"), button:has-text("Accept all")').first.click(timeout=1000)
+        page.locator('button:has-text("Accept all cookies"), button:has-text("Allow all cookies"), button:has-text("Accept all")').first.click(timeout=1000)
     except:  # noqa: E722
         pass
 
