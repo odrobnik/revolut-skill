@@ -198,6 +198,53 @@ def _write_json(path: Path, payload: Any) -> None:
 def _parse_iso_date(s: str) -> str:
     return datetime.strptime(s, "%Y-%m-%d").date().isoformat()
 
+def _date_to_ms_bounds_utc(d: str) -> tuple[int, int]:
+    dt0 = datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    start_ms = int(dt0.timestamp() * 1000)
+    end_ms = int((dt0.replace(hour=23, minute=59, second=59, microsecond=999000)).timestamp() * 1000)
+    return start_ms, end_ms
+
+def _raw_tx_timestamp_ms(tx: dict) -> int | None:
+    for key in ("completedAt", "startedDate"):
+        if key not in tx:
+            continue
+        v = tx.get(key)
+        if isinstance(v, (int, float)):
+            ms = int(v)
+        elif isinstance(v, str):
+            try:
+                ms = int(float(v.strip()))
+            except Exception:
+                continue
+        else:
+            continue
+        if ms < 1_000_000_000_000:
+            ms *= 1000
+        return ms
+    return None
+
+def _raw_tx_dedupe_key(tx: dict) -> tuple:
+    for key in ("id", "transactionId", "transferId", "reference", "externalId"):
+        v = tx.get(key)
+        if v is not None and str(v).strip():
+            return ("id", key, str(v))
+    amt_obj = tx.get("amount") or tx.get("money") or tx.get("balanceChange")
+    amt_val = _extract_amount(amt_obj)
+    ccy = _extract_currency(amt_obj) or ((tx.get("currency") or "").strip().upper() if isinstance(tx.get("currency"), str) else "")
+    desc = (tx.get("description") or tx.get("title") or (tx.get("merchant") or {}).get("name") or "")
+    return ("fuzzy", _raw_tx_timestamp_ms(tx), amt_val, ccy, desc)
+
+def _extract_tx_items(payload: Any) -> list[dict]:
+    if isinstance(payload, list):
+        return [t for t in payload if isinstance(t, dict)]
+    if isinstance(payload, dict):
+        for key in ("transactions", "data", "items"):
+            v = payload.get(key)
+            if isinstance(v, list):
+                return [t for t in v if isinstance(t, dict)]
+        return [payload]
+    return []
+
 
 def _slug(s: str) -> str:
     s = (s or "").strip().lower()
@@ -1238,8 +1285,34 @@ def cmd_transactions(args) -> int:
     debug = bool(getattr(args, "debug", False))
     headless = not bool(getattr(args, "visible", False))
     # Revolut wallet endpoint can become flaky with very large counts. Keep it fixed.
-    count = 100
+    count = 50
     account_id = getattr(args, "account", None)
+    date_from = getattr(args, "date_from", None)
+    date_until = getattr(args, "date_until", None)
+
+    if (date_from and not date_until) or (date_until and not date_from):
+        print("[revolut] ERROR: --from and --until must be provided together.", file=sys.stderr)
+        return 2
+
+    paging_enabled = bool(date_from and date_until)
+    from_ms = None
+    until_ms = None
+    from_date = None
+    until_date = None
+    if paging_enabled:
+        try:
+            _parse_iso_date(date_from)
+            _parse_iso_date(date_until)
+        except ValueError:
+            print("[revolut] ERROR: Dates must be in YYYY-MM-DD format.", file=sys.stderr)
+            return 2
+        from_date = datetime.strptime(date_from, "%Y-%m-%d").date()
+        until_date = datetime.strptime(date_until, "%Y-%m-%d").date()
+        if from_date > until_date:
+            print("[revolut] ERROR: --from must be on or before --until.", file=sys.stderr)
+            return 2
+        from_ms, _ = _date_to_ms_bounds_utc(date_from)
+        _, until_ms = _date_to_ms_bounds_utc(date_until)
 
     with sync_playwright() as p:  # type: ignore[misc]
         context = _launch_persistent_context(p, args, headless=headless)
@@ -1256,45 +1329,116 @@ def cmd_transactions(args) -> int:
         # Default: last transactions (mixed)
         # If account provided: use internalPocketId
         base_url = f"/api/retail/user/current/transactions/last?count={count}"
+        internal_pocket_qs = ""
         if account_id:
             # We assume the user passed the UUID. If they passed a name/currency, we can't easily resolve it without fetching accounts first.
             # But usually we pass UUIDs.
             # However, if it's a UUID, we append internalPocketId.
             # If it's not a UUID (like "USD"), we might fail. 
             # Ideally we should resolve it, but let's assume UUID for now or try to fetch regardless.
-            
-            # Simple UUID check regex
             if re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', account_id, re.I):
-                base_url += f"&internalPocketId={account_id}"
+                internal_pocket_qs = f"&internalPocketId={account_id}"
+                base_url += internal_pocket_qs
             else:
-                 print(f"[revolut] Warning: Account ID '{account_id}' does not look like a UUID. API might ignore it or fail.", file=sys.stderr)
+                print(f"[revolut] Warning: Account ID '{account_id}' does not look like a UUID. API might ignore it or fail.", file=sys.stderr)
 
         # Capture headers from environment
         api_headers = _get_api_headers(page)
-        
-        # Use JS fetch instead of interception for reliability and param support
-        raw_txs = _fetch_via_api_call(page, base_url, api_headers)
-        
-        # Fallback to interception if JS fetch returns null (e.g. CORS or strict CSP, though usually fine on same origin)
-        if raw_txs is None:
-             print("[revolut] JS fetch returned null. Trying interception fallback...", file=sys.stderr)
-             raw_txs = _fetch_via_interception(page, "/api/retail/user/current/transactions/last")
-        
-        if not raw_txs:
-             print("[revolut] Failed to fetch transactions.", file=sys.stderr)
-             context.close()
-             return 3
 
-        if debug:
-            _write_json(state_file.parent / "revolut_raw_transactions.json", raw_txs)
+        all_raw_items: list[dict] = []
+        seen_keys: set[tuple] = set()
 
-        txs = canonicalize_revolut_transactions(raw_txs, filter_account_id=account_id)
+        if paging_enabled:
+            cur_to_ms = int(until_ms)
+            page_idx = 0
+            while True:
+                page_idx += 1
+                url = f"/api/retail/user/current/transactions/last?to={cur_to_ms}&count={count}{internal_pocket_qs}"
+                raw_txs = _fetch_via_api_call(page, url, api_headers)
+
+                # Fallback to interception if JS fetch returns null (e.g. CORS or strict CSP, though usually fine on same origin)
+                if raw_txs is None:
+                    print("[revolut] JS fetch returned null. Trying interception fallback...", file=sys.stderr)
+                    raw_txs = _fetch_via_interception(page, "/api/retail/user/current/transactions/last")
+
+                if not raw_txs:
+                    print("[revolut] Failed to fetch transactions.", file=sys.stderr)
+                    context.close()
+                    return 3
+
+                if debug:
+                    _write_json(state_file.parent / f"revolut_raw_transactions_p{page_idx}.json", raw_txs)
+
+                items = _extract_tx_items(raw_txs)
+                print(f"[revolut] Paging transactions: page={page_idx} to={cur_to_ms} items={len(items)}", file=sys.stderr)
+
+                if not items:
+                    break
+
+                oldest_ms = None
+                for item in items:
+                    key = _raw_tx_dedupe_key(item)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    all_raw_items.append(item)
+
+                    ts_ms = _raw_tx_timestamp_ms(item)
+                    if ts_ms is not None and (oldest_ms is None or ts_ms < oldest_ms):
+                        oldest_ms = ts_ms
+
+                if oldest_ms is None:
+                    break
+
+                if oldest_ms <= from_ms:
+                    break
+
+                next_to = int(oldest_ms) - 1
+                if next_to >= cur_to_ms:
+                    break
+                cur_to_ms = next_to
+        else:
+            # Use JS fetch instead of interception for reliability and param support
+            raw_txs = _fetch_via_api_call(page, base_url, api_headers)
+
+            # Fallback to interception if JS fetch returns null (e.g. CORS or strict CSP, though usually fine on same origin)
+            if raw_txs is None:
+                print("[revolut] JS fetch returned null. Trying interception fallback...", file=sys.stderr)
+                raw_txs = _fetch_via_interception(page, "/api/retail/user/current/transactions/last")
+
+            if not raw_txs:
+                print("[revolut] Failed to fetch transactions.", file=sys.stderr)
+                context.close()
+                return 3
+
+            if debug:
+                _write_json(state_file.parent / "revolut_raw_transactions.json", raw_txs)
+
+            all_raw_items = _extract_tx_items(raw_txs)
+
+        txs = canonicalize_revolut_transactions(all_raw_items, filter_account_id=account_id)
+        if paging_enabled and from_date and until_date:
+            filtered = []
+            for tx in txs:
+                bd = tx.get("bookingDate")
+                if not isinstance(bd, str):
+                    continue
+                try:
+                    d = datetime.strptime(bd, "%Y-%m-%d").date()
+                except Exception:
+                    continue
+                if from_date <= d <= until_date:
+                    filtered.append(tx)
+            txs = filtered
         
         wrapper: dict[str, Any] = {
             "institution": "revolut",
             "fetchedAt": _now_iso_local(),
             "transactions": txs,
         }
+
+        if paging_enabled:
+            wrapper["range"] = {"from": date_from, "until": date_until}
         
         if account_id:
             wrapper["account"] = {"id": account_id}
@@ -1758,6 +1902,8 @@ def main() -> int:
 
     p_tx = sub.add_parser("transactions", help="Fetch wallet transactions from Revolut Web")
     p_tx.add_argument("--account", default=None, help="Account selector")
+    p_tx.add_argument("--from", dest="date_from", default=None, help="Start date (YYYY-MM-DD)")
+    p_tx.add_argument("--until", dest="date_until", default=None, help="End date (YYYY-MM-DD)")
     p_tx.set_defaults(func=cmd_transactions)
 
     p_pf = sub.add_parser("portfolio", help="Fetch Revolut Invest (stocks) portfolio holdings")
