@@ -961,17 +961,36 @@ def cmd_accounts(args) -> int:
         return 0
 
 
-def _get_api_headers(page) -> dict:
-    """Capture headers from background requests to reuse authentication tokens."""
+def _get_api_headers(page, trigger_reload: bool = False) -> dict:
+    """Capture headers from background requests to reuse authentication tokens.
+
+    Revolut's JS client sends important headers (x-device-id, x-browser-application, x-client-version, ...)
+    that are not automatically added by the browser. We sniff them from real in-app requests.
+
+    If trigger_reload=True, we reload once to force the app to emit background /api/retail requests.
+    """
     captured = []
+
     def on_request(request):
         if "/api/retail" in request.url and not captured:
             h = request.headers
             if "x-device-id" in h:
                 captured.append(h)
-                
+
     page.on("request", on_request)
-    
+
+    # Cookie banner can block the app from making API calls.
+    try:
+        page.locator('button:has-text("Allow all cookies"), button:has-text("Accept all cookies"), button:has-text("Accept all")').first.click(timeout=1000)
+    except Exception:
+        pass
+
+    if trigger_reload:
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+
     # Wait up to 5s for a request (usually Home loads them immediately)
     for _ in range(50):
         if captured:
@@ -980,15 +999,14 @@ def _get_api_headers(page) -> dict:
             page.wait_for_timeout(100)
         except:  # noqa: E722
             break
-        
+
     if captured:
         orig = captured[0]
-        # Copy relevant headers
         out = {}
-        # These seem critical for Revolut API
         keys = ["x-device-id", "x-browser-application", "x-client-version", "x-timezone", "device-id"]
         for k in keys:
-            if k in orig: out[k] = orig[k]
+            if k in orig:
+                out[k] = orig[k]
         return out
     return {}
 
@@ -1356,7 +1374,7 @@ def cmd_invest_transactions(args) -> int:
         
         # Capture auth headers from the initial Invest app load (it emits /api/retail calls that
         # include x-device-id, x-browser-application, x-client-version, etc.).
-        headers = _get_api_headers(page)
+        headers = _get_api_headers(page, trigger_reload=True)
 
         # Navigate to the transactions activity page so the request origin/referrer matches
         # what the web client uses.
