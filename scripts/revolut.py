@@ -685,6 +685,15 @@ def _handle_auth_challenge(page, success_url_pattern="**/home**", auth_timeout_m
             # Keep a trace in logs, but don't duplicate the payload line.
             print(f"[revolut] IMPORTANT: Approve in Revolut app via: {login_url}", file=sys.stderr)
         else:
+            # If we're already inside the Invest app (trade/activity/etc.), don't flag this as an auth challenge.
+            # Only treat it as suspicious when we're on SSO/passcode flows.
+            try:
+                cur = page.url or ""
+                if "invest.revolut.com" in cur and "sso.revolut.com" not in cur:
+                    return True
+            except Exception:
+                pass
+
             # Still useful to capture what we're seeing
             try:
                 shot = TMP_DIR / "revolut_auth_debug.png"
@@ -1405,7 +1414,8 @@ def cmd_invest_transactions(args) -> int:
         
         try:
             page.goto(INVEST_HOME_URL, wait_until="domcontentloaded", timeout=15000)
-            ok = _handle_auth_challenge(page, success_url_pattern="**/portfolio**")
+            # We consider ourselves authenticated once we're in the actual Invest trading UI.
+            ok = _handle_auth_challenge(page, success_url_pattern="**/trade/**")
             if not ok:
                 if _LAST_AUTH_EXPIRED:
                     print("QR code expired, please try again", file=sys.stderr)
