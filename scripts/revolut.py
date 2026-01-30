@@ -1009,7 +1009,7 @@ def _fetch_via_api_call(page, url: str, extra_headers: dict = {}, method: str = 
                     const body = {body_json};
 
                     const headers = {{
-                        'Accept': 'application/json',
+                        'Accept': 'application/json, text/plain, */*',
                         ...extra
                     }};
 
@@ -1354,46 +1354,40 @@ def cmd_invest_transactions(args) -> int:
         except:  # noqa: E722
             pass
         
+        # Navigate to the transactions activity page first so the request origin/referrer matches
+        # what the web client uses (and so background requests populate auth headers).
+        try:
+            page.goto("https://invest.revolut.com/activity/transactions", wait_until="domcontentloaded", timeout=15000)
+            time.sleep(1)
+            try:
+                page.locator('button:has-text("Allow all cookies"), button:has-text("Accept all cookies"), button:has-text("Accept all")').first.click(timeout=1500)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
         headers = _get_api_headers(page)
 
-        # Fetch portfolio holdings to build name map (ref/symbol -> name)
+        # Optional name enrichment (best-effort; may fail when Revolut changes endpoints)
         name_map: dict[str, str] = {}
-        try:
-            raw_list = _fetch_via_api_call(page, "/api/retail/trading-access/portfolios", headers)
-            if isinstance(raw_list, list):
-                for pf in raw_list:
-                    pid = pf.get("id") if isinstance(pf, dict) else None
-                    if pid:
-                        raw_pf = _fetch_via_api_call(page, f"/api/retail/trading-access/portfolios/{pid}", headers)
-                        holdings = raw_pf.get("holdings", []) if isinstance(raw_pf, dict) else []
-                        if isinstance(holdings, list):
-                            for h in holdings:
-                                if not isinstance(h, dict):
-                                    continue
-                                hname = h.get("name")
-                                if hname:
-                                    ref = h.get("ref") or h.get("id")
-                                    symbol = h.get("symbol")
-                                    if ref:
-                                        name_map[ref] = hname
-                                    if symbol:
-                                        name_map[symbol] = hname
-        except Exception:
-            pass  # Continue without name enrichment if portfolio fetch fails
 
-        # Revolut Invest trade history endpoint evolves frequently.
-        # As of 2026-01, we observe /api/retail/trading/orders on invest.revolut.com.
-        urls = [
-            f"/api/retail/trading/orders?limit={count}",
-            "/api/retail/trading/orders",
-        ]
-        raw = None
-        for u in urls:
-            raw = _fetch_via_api_call(page, u, headers)
-            if raw is not None:
-                break
+        # Correct trade history endpoint observed in the web client:
+        # https://invest.revolut.com/api/retail/trading/transactions?limit=...&accountType=GIA&to=...&from=0
+        import datetime
+        now = datetime.datetime.now().astimezone()
+        eod = now.replace(hour=23, minute=59, second=59, microsecond=999000)
+        to_ms = int(eod.timestamp() * 1000)
+        url = f"/api/retail/trading/transactions?limit={count}&accountType=GIA&to={to_ms}&from=0"
 
-        if raw is None:
+        raw = _fetch_via_api_call(page, url, headers)
+
+        # Fallbacks (endpoint variations)
+        if isinstance(raw, dict) and raw.get("error"):
+            raw = _fetch_via_api_call(page, f"/api/retail/trading/transactions?limit={count}&accountType=GIA&to={to_ms}", headers)
+        if isinstance(raw, dict) and raw.get("error"):
+            raw = _fetch_via_api_call(page, f"/api/retail/trading/transactions?limit={count}&accountType=GIA", headers)
+
+        if raw is None or (isinstance(raw, dict) and raw.get("error")):
             print("[revolut] Failed to fetch invest transactions.", file=sys.stderr)
             browser.close()
             return 3
