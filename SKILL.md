@@ -19,6 +19,10 @@ python3 {baseDir}/scripts/revolut.py login
 python3 {baseDir}/scripts/revolut.py logout
 python3 {baseDir}/scripts/revolut.py accounts
 python3 {baseDir}/scripts/revolut.py transactions --account EUR
+
+# Revolut Invest (stocks)
+python3 {baseDir}/scripts/revolut.py portfolio
+python3 {baseDir}/scripts/revolut.py invest-transactions --count 200
 ```
 
 ## Notes
