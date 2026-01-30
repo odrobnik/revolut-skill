@@ -1898,6 +1898,9 @@ def main() -> int:
 
     p_acc = sub.add_parser("accounts", help="Fetch accounts (wallets) from Revolut Web")
     p_acc.add_argument("--json", action="store_true", help="(kept for parity)")
+    p_acc.add_argument("--include-depot", action="store_true", help="Also include Revolut Invest (GIA) as a synthetic depot account")
+    p_acc.add_argument("--portfolio-id", default=None, help="Optional portfolio id (if you want to force a specific Invest portfolio)")
+    p_acc.add_argument("--depot-account", default="revolut_gia", help="Account id to use for the synthetic depot entry (default: revolut_gia)")
     p_acc.set_defaults(func=cmd_accounts)
 
     p_tx = sub.add_parser("transactions", help="Fetch wallet transactions from Revolut Web")
