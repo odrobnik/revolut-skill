@@ -42,7 +42,20 @@ else:
         PlaywrightTimeout = Exception  # type: ignore
 
 
-WORKSPACE_DIR = Path(os.environ.get("MOLTBOT_WORKSPACE", "/Users/oliver/clawd")).expanduser().resolve()
+def _find_workspace_root() -> Path:
+    """Walk up from script location to find workspace root (parent of 'skills/')."""
+    env = os.environ.get("REVOLUT_WORKSPACE") or os.environ.get("MOLTBOT_WORKSPACE")
+    if env:
+        return Path(env).expanduser().resolve()
+    d = Path(__file__).resolve().parent
+    for _ in range(6):
+        if (d / "skills").is_dir() and d != d.parent:
+            return d
+        d = d.parent
+    return Path.cwd()
+
+
+WORKSPACE_DIR = _find_workspace_root()
 
 # Ephemeral outputs (OCR markdown + default JSON output dir) go to /tmp by default.
 # Override with MOLTBOT_TMP if you want a different temp root.
