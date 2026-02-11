@@ -47,6 +47,12 @@ def _find_workspace_root() -> Path:
     env = os.environ.get("REVOLUT_WORKSPACE") or os.environ.get("MOLTBOT_WORKSPACE")
     if env:
         return Path(env).expanduser().resolve()
+    
+    # Prefer CWD if it looks like a workspace (handles symlinks correctly)
+    cwd = Path.cwd()
+    if (cwd / "skills").is_dir():
+        return cwd
+
     d = Path(__file__).resolve().parent
     for _ in range(6):
         if (d / "skills").is_dir() and d != d.parent:

@@ -3,7 +3,7 @@ name: revolut
 description: "Revolut web automation via Playwright: login/logout, list accounts, and fetch transactions."
 summary: "Revolut banking automation: login, accounts, transactions."
 version: 0.2.0
-metadata: {"moltbot": {"emoji": "💳", "requires": {"bins": ["python3", "playwright"]}}}
+metadata: {"openclaw": {"emoji": "💳", "requires": {"bins": ["python3", "playwright"]}}}
 ---
 
 # Revolut (Web Automation)
