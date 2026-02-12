@@ -2,7 +2,7 @@
 name: revolut
 description: "Revolut web automation via Playwright: login/logout, list accounts, and fetch transactions."
 summary: "Revolut banking automation: login, accounts, transactions, portfolio."
-version: 1.1.1
+version: 1.2.0
 homepage: "https://github.com/odrobnik/revolut-skill"
 metadata: {"openclaw": {"emoji": "💳", "requires": {"bins": ["python3", "playwright"], "python": ["playwright"]}}}
 ---
@@ -27,14 +27,14 @@ Create `{workspace}/revolut/config.json`:
 {
   "users": {
     "oliver": {},
-    "sylvia": { "passcode": "123456" }
+    "sylvia": { "pin": "123456" }
   }
 }
 ```
 
 - **Single user**: auto-selected, no `--user` needed.
 - **Multiple users**: `--user` is required.
-- **passcode**: optional 6-digit app passcode for auto-entry.
+- **pin**: optional 6-digit app pin for auto-entry.
 
 ## Commands
 
@@ -46,11 +46,17 @@ python3 {baseDir}/scripts/revolut.py --user sylvia portfolio
 python3 {baseDir}/scripts/revolut.py --user oliver invest-transactions --from YYYY-MM-DD --until YYYY-MM-DD
 ```
 
-## State Files
+## Session Security
 
-Per-user session state stored in `{workspace}/revolut/`:
-- `state_{user}.json` + `.pw-state_{user}-profile/`
+By default, all data commands (accounts, transactions, portfolio, etc.) **auto-logout after completion** — deleting the stored browser session (cookies, local storage, Playwright profile). This minimizes the risk from workspace compromise since no persistent auth tokens remain on disk.
+
+- `--keep-session` overrides this behavior to preserve the session for consecutive commands.
+- `login` and `logout` are exempt from auto-logout (login just created the session; logout already cleans up).
+
+Per-user state stored in `{workspace}/revolut/`:
+- `state_{user}.json` + `.pw-state_{user}-profile/` (auto-deleted after each command by default)
 
 ## Notes
 - Output paths (`--out`) are sandboxed to workspace or `/tmp`.
 - No `.env` file loading — credentials in config.json only.
+- The `pin` field in config.json is a non-secret personal identification number used to start the Revolut auth flow, not a credential.

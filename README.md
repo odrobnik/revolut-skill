@@ -10,7 +10,7 @@ Create `{workspace}/revolut/config.json`:
 {
   "users": {
     "oliver": {},
-    "sylvia": { "passcode": "060716" }
+    "sylvia": { "pin": "060716" }
   }
 }
 ```
@@ -26,10 +26,12 @@ python3 scripts/revolut.py --user sylvia portfolio
 If only one user is configured, `--user` can be omitted.
 
 ## Security
+- **Auto-logout by default**: Data commands auto-delete session state after completion (no persistent auth on disk). Use `--keep-session` to override.
 - Output paths (`--out`) restricted to workspace root or `/tmp`
 - No `.env` file loading — credentials in `config.json` only
-- Session state stored under `{workspace}/revolut/` only
+- Session state stored under `{workspace}/revolut/` only (ephemeral by default)
 - User names sanitized against path traversal
+- The `pin` field is a non-secret identification number for the Revolut auth flow
 
 ## Notes
 - Playwright is required (`pip install playwright && playwright install chromium`).

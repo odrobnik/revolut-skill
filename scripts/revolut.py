@@ -341,9 +341,9 @@ def _state_file_from_args(args) -> Path:
     return CONFIG_DIR / "state.json"
 
 
-def _looks_like_passcode_screen(text: str) -> bool:
+def _looks_like_pin_screen(text: str) -> bool:
     t = (text or "").lower()
-    return "enter passcode" in t or "forgot your passcode" in t
+    return "enter passcode" in t or "forgot your passcode" in t or "enter pin" in t
 
 
 def _fetch_via_interception(page, url_pattern: str, timeout_ms: int = 30000) -> dict | None:
@@ -793,23 +793,23 @@ def _resolve_account_selector(accounts: list[dict], selector: str) -> dict:
     return accounts[0] if accounts else {}
 
 
-def _handle_passcode_screen(page, passcode: str | None = None):
-    """Enter passcode if screen detected.
+def _handle_pin_screen(page, pin: str | None = None):
+    """Enter pin if screen detected.
 
-    Passcode is read from user config in config.json (or passed explicitly).
+    Pin is read from user config in config.json (or passed explicitly).
     """
-    if not passcode:
+    if not pin:
         return False
     try:
-        if _looks_like_passcode_screen(page.inner_text("body")):
-            print("[revolut] Passcode screen detected. Entering PIN...", file=sys.stderr)
+        if _looks_like_pin_screen(page.inner_text("body")):
+            print("[revolut] Pin screen detected. Entering PIN...", file=sys.stderr)
             inputs = page.locator('input[aria-label^="Code input"], input[aria-label^="Codeinput"], input[inputmode="numeric"], input[type="password"]')
             if inputs.count() > 0:
                 first = inputs.first
                 first.click()
                 time.sleep(0.5)
                 
-                for digit in passcode:
+                for digit in pin:
                     page.keyboard.type(digit)
                     time.sleep(random.uniform(0.1, 0.3))
                 
@@ -817,7 +817,7 @@ def _handle_passcode_screen(page, passcode: str | None = None):
                 time.sleep(3)
                 return True
     except Exception as e:
-        print(f"[revolut] Error handling passcode: {e}", file=sys.stderr)
+        print(f"[revolut] Error handling pin: {e}", file=sys.stderr)
     return False
 
 _LAST_AUTH_EXPIRED = False
@@ -889,13 +889,13 @@ def _try_extract_qr_url(page) -> str | None:
     return None
 
 
-def _handle_auth_challenge(page, success_url_pattern="**/home**", auth_timeout_ms: int = 600_000, passcode: str | None = None):
+def _handle_auth_challenge(page, success_url_pattern="**/home**", auth_timeout_ms: int = 600_000, pin: str | None = None):
     global _LAST_AUTH_EXPIRED
     _LAST_AUTH_EXPIRED = False
     """Handle PIN and/or QR code challenge if they appear.
 
     Revolut can require:
-    - Passcode entry
+    - Pin entry
     - QR-based login approval
     - (sometimes) just waiting for an SSO redirect
     """
@@ -915,8 +915,8 @@ def _handle_auth_challenge(page, success_url_pattern="**/home**", auth_timeout_m
     except:  # noqa: E722
         pass
 
-    # 1) Passcode
-    if _handle_passcode_screen(page, passcode=passcode):
+    # 1) Pin
+    if _handle_pin_screen(page, pin=pin):
         time.sleep(1)
 
     # If we're already where we need to be, we're done.
@@ -953,7 +953,7 @@ def _handle_auth_challenge(page, success_url_pattern="**/home**", auth_timeout_m
                 pass
         else:
             # If we're already inside the Invest app (trade/activity/etc.), don't flag this as an auth challenge.
-            # Only treat it as suspicious when we're on SSO/passcode flows.
+            # Only treat it as suspicious when we're on SSO/pin flows.
             try:
                 cur = page.url or ""
                 if "invest.revolut.com" in cur and "sso.revolut.com" not in cur:
@@ -1038,7 +1038,7 @@ def cmd_login(args) -> int:
         except Exception:
             pass
 
-        ok = _handle_auth_challenge(page, success_url_pattern="**/home**", passcode=getattr(args, "_passcode", None))
+        ok = _handle_auth_challenge(page, success_url_pattern="**/home**", pin=getattr(args, "_pin", None))
         if not ok:
             if _LAST_AUTH_EXPIRED:
                 print("QR code expired, please try again", file=sys.stderr)
@@ -1101,10 +1101,10 @@ def cmd_accounts(args) -> int:
         context = _launch_persistent_context(p, args, headless=headless)
         page = context.new_page()
 
-        # Check for passcode/QR if redirected to login
+        # Check for pin/QR if redirected to login
         try:
             page.goto(REVOLUT_HOME_URL, wait_until="domcontentloaded", timeout=15000)
-            ok = _handle_auth_challenge(page, success_url_pattern="**/home**", passcode=getattr(args, "_passcode", None))
+            ok = _handle_auth_challenge(page, success_url_pattern="**/home**", pin=getattr(args, "_pin", None))
             if not ok:
                 if _LAST_AUTH_EXPIRED:
                     print("QR code expired, please try again", file=sys.stderr)
@@ -1147,7 +1147,7 @@ def cmd_accounts(args) -> int:
         # We need to enter Invest context to access its APIs.
         try:
             page.goto(INVEST_HOME_URL, wait_until="domcontentloaded", timeout=15000)
-            ok = _handle_auth_challenge(page, success_url_pattern="**/trade/**", passcode=getattr(args, "_passcode", None))
+            ok = _handle_auth_challenge(page, success_url_pattern="**/trade/**", pin=getattr(args, "_pin", None))
             if not ok:
                 if _LAST_AUTH_EXPIRED:
                     print("QR code expired, please try again", file=sys.stderr)
@@ -1422,7 +1422,7 @@ def cmd_transactions(args) -> int:
 
         try:
             page.goto(REVOLUT_HOME_URL, wait_until="domcontentloaded", timeout=30000)
-            _handle_auth_challenge(page, success_url_pattern="**/home**", passcode=getattr(args, "_passcode", None))
+            _handle_auth_challenge(page, success_url_pattern="**/home**", pin=getattr(args, "_pin", None))
             time.sleep(1)
         except Exception:
             pass
@@ -1577,7 +1577,7 @@ def cmd_portfolio(args) -> int:
 
         try:
             page.goto(INVEST_HOME_URL, wait_until="domcontentloaded", timeout=15000)
-            ok = _handle_auth_challenge(page, success_url_pattern="**/portfolio**", passcode=getattr(args, "_passcode", None))
+            ok = _handle_auth_challenge(page, success_url_pattern="**/portfolio**", pin=getattr(args, "_pin", None))
             if not ok:
                 if _LAST_AUTH_EXPIRED:
                     print("QR code expired, please try again", file=sys.stderr)
@@ -1713,7 +1713,7 @@ def cmd_invest_scan(args) -> int:
 
         try:
             page.goto(INVEST_HOME_URL, wait_until="domcontentloaded", timeout=15000)
-            ok = _handle_auth_challenge(page, success_url_pattern="**/portfolio**", passcode=getattr(args, "_passcode", None))
+            ok = _handle_auth_challenge(page, success_url_pattern="**/portfolio**", pin=getattr(args, "_pin", None))
             if not ok:
                 if _LAST_AUTH_EXPIRED:
                     print("QR code expired, please try again", file=sys.stderr)
@@ -1798,7 +1798,7 @@ def cmd_invest_transactions(args) -> int:
         try:
             page.goto(INVEST_HOME_URL, wait_until="domcontentloaded", timeout=15000)
             # We consider ourselves authenticated once we're in the actual Invest trading UI.
-            ok = _handle_auth_challenge(page, success_url_pattern="**/trade/**", passcode=getattr(args, "_passcode", None))
+            ok = _handle_auth_challenge(page, success_url_pattern="**/trade/**", pin=getattr(args, "_pin", None))
             if not ok:
                 if _LAST_AUTH_EXPIRED:
                     print("QR code expired, please try again", file=sys.stderr)
@@ -1988,6 +1988,8 @@ def main() -> int:
     parser.add_argument("--debug", action="store_true", help="Save raw Revolut payloads")
     parser.add_argument("--out", default=None, help="Write JSON output to file (must be under workspace or /tmp)")
     parser.add_argument("--user", default=None, help="User profile name (uses revolut_state_{user}.json)")
+    parser.add_argument("--keep-session", action="store_true",
+                        help="Do not auto-logout after command (default: auto-logout to minimize stored auth state)")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -2024,12 +2026,25 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    # Resolve user early — attaches passcode to args for all commands
+    # Resolve user early — attaches pin to args for all commands
     user_name, user_cfg = _resolve_user(args.user)
     args._user_name = user_name
-    args._passcode = user_cfg.get("passcode")
+    args._pin = user_cfg.get("pin")
 
-    return int(args.func(args) or 0)
+    result = int(args.func(args) or 0)
+
+    # Auto-logout after data commands to minimize stored auth state.
+    # Skip for login (just created session), logout (already cleaned up),
+    # and when --keep-session is explicitly requested.
+    no_auto_logout = {"login", "logout"}
+    if args.command not in no_auto_logout and not args.keep_session:
+        try:
+            cmd_logout(args)
+            print("[revolut] Auto-logout: session cleaned up", file=sys.stderr)
+        except Exception as e:
+            print(f"[revolut] Auto-logout failed: {e}", file=sys.stderr)
+
+    return result
 
 
 if __name__ == "__main__":
