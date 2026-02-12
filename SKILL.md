@@ -2,7 +2,7 @@
 name: revolut
 description: "Revolut web automation via Playwright: login/logout, list accounts, and fetch transactions."
 summary: "Revolut banking automation: login, accounts, transactions, portfolio."
-version: 1.1.0
+version: 1.1.1
 homepage: "https://github.com/odrobnik/revolut-skill"
 metadata: {"openclaw": {"emoji": "💳", "requires": {"bins": ["python3", "playwright"], "python": ["playwright"]}}}
 ---
