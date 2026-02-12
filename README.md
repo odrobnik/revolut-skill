@@ -26,10 +26,10 @@ python3 scripts/revolut.py --user sylvia portfolio
 If only one user is configured, `--user` can be omitted.
 
 ## Security
-- **Auto-logout by default**: Data commands auto-delete session state after completion (no persistent auth on disk). Use `--keep-session` to override.
+- **Recommended flow**: `login` → operations → `logout` (always logout to clear session state)
 - Output paths (`--out`) restricted to workspace root or `/tmp`
 - No `.env` file loading — credentials in `config.json` only
-- Session state stored under `{workspace}/revolut/` only (ephemeral by default)
+- Session state stored under `{workspace}/revolut/` only (deleted by `logout`)
 - User names sanitized against path traversal
 - The `pin` field is a non-secret identification number for the Revolut auth flow
 

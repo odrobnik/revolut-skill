@@ -46,15 +46,16 @@ python3 {baseDir}/scripts/revolut.py --user sylvia portfolio
 python3 {baseDir}/scripts/revolut.py --user oliver invest-transactions --from YYYY-MM-DD --until YYYY-MM-DD
 ```
 
-## Session Security
+## Recommended Flow
 
-By default, all data commands (accounts, transactions, portfolio, etc.) **auto-logout after completion** — deleting the stored browser session (cookies, local storage, Playwright profile). This minimizes the risk from workspace compromise since no persistent auth tokens remain on disk.
+```
+login → accounts → transactions → portfolio → logout
+```
 
-- `--keep-session` overrides this behavior to preserve the session for consecutive commands.
-- `login` and `logout` are exempt from auto-logout (login just created the session; logout already cleans up).
+Always call `logout` after completing all operations to delete the stored browser session (cookies, local storage, Playwright profile). This minimizes persistent auth state on disk.
 
 Per-user state stored in `{workspace}/revolut/`:
-- `state_{user}.json` + `.pw-state_{user}-profile/` (auto-deleted after each command by default)
+- `state_{user}.json` + `.pw-state_{user}-profile/` (deleted by `logout`)
 
 ## Notes
 - Output paths (`--out`) are sandboxed to workspace or `/tmp`.

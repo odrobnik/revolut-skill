@@ -1988,8 +1988,6 @@ def main() -> int:
     parser.add_argument("--debug", action="store_true", help="Save raw Revolut payloads")
     parser.add_argument("--out", default=None, help="Write JSON output to file (must be under workspace or /tmp)")
     parser.add_argument("--user", default=None, help="User profile name (uses revolut_state_{user}.json)")
-    parser.add_argument("--keep-session", action="store_true",
-                        help="Do not auto-logout after command (default: auto-logout to minimize stored auth state)")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -2031,20 +2029,7 @@ def main() -> int:
     args._user_name = user_name
     args._pin = user_cfg.get("pin")
 
-    result = int(args.func(args) or 0)
-
-    # Auto-logout after data commands to minimize stored auth state.
-    # Skip for login (just created session), logout (already cleaned up),
-    # and when --keep-session is explicitly requested.
-    no_auto_logout = {"login", "logout"}
-    if args.command not in no_auto_logout and not args.keep_session:
-        try:
-            cmd_logout(args)
-            print("[revolut] Auto-logout: session cleaned up", file=sys.stderr)
-        except Exception as e:
-            print(f"[revolut] Auto-logout failed: {e}", file=sys.stderr)
-
-    return result
+    return int(args.func(args) or 0)
 
 
 if __name__ == "__main__":
