@@ -1,16 +1,37 @@
 # Revolut Skill
 
-Unified web automation for Revolut: login, logout, accounts, transactions.
+Unified web automation for Revolut: login, logout, accounts, transactions, portfolio.
+
+## Setup
+
+Create `{workspace}/revolut/config.json`:
+
+```json
+{
+  "users": {
+    "oliver": {},
+    "sylvia": { "passcode": "060716" }
+  }
+}
+```
 
 ## Usage
 ```bash
-python3 scripts/revolut.py login
-python3 scripts/revolut.py logout
-python3 scripts/revolut.py accounts
-python3 scripts/revolut.py transactions --account EUR
+python3 scripts/revolut.py --user oliver login
+python3 scripts/revolut.py --user oliver accounts
+python3 scripts/revolut.py --user oliver transactions --from 2025-01-01 --until 2026-01-31
+python3 scripts/revolut.py --user sylvia portfolio
 ```
 
+If only one user is configured, `--user` can be omitted.
+
+## Security
+- Output paths (`--out`) restricted to workspace root or `/tmp`
+- No `.env` file loading — credentials in `config.json` only
+- Session state stored under `{workspace}/revolut/` only
+- User names sanitized against path traversal
+
 ## Notes
-- Playwright is required.
-- Session state is stored in `~/clawd/revolut_state.json` by default (override with `--state`).
+- Playwright is required (`pip install playwright && playwright install chromium`).
+- QR code screenshot saved to `/tmp/openclaw/revolut/revolut_qr.png` during login.
 - See `SKILL.md` for agent usage guidance.

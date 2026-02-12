@@ -16,15 +16,12 @@ sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
 import argparse
-import csv
 import json
 import os
 import re
-import subprocess
 import shutil
 import time
 import random
-from dataclasses import dataclass
 from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Any
@@ -44,7 +41,7 @@ else:
 
 def _find_workspace_root() -> Path:
     """Walk up from script location to find workspace root (parent of 'skills/')."""
-    env = os.environ.get("REVOLUT_WORKSPACE") or os.environ.get("MOLTBOT_WORKSPACE")
+    env = os.environ.get("OPENCLAW_WORKSPACE")
     if env:
         return Path(env).expanduser().resolve()
     
@@ -64,20 +61,67 @@ def _find_workspace_root() -> Path:
 WORKSPACE_DIR = _find_workspace_root()
 
 # Ephemeral outputs (OCR markdown + default JSON output dir) go to /tmp by default.
-# Override with MOLTBOT_TMP if you want a different temp root.
-_TMP_ROOT = Path(os.environ.get("MOLTBOT_TMP", "/tmp")).expanduser().resolve()
-TMP_DIR = _TMP_ROOT / "moltbot" / "revolut"
+# Override with OPENCLAW_TMP if you want a different temp root.
+_TMP_ROOT = Path(os.environ.get("OPENCLAW_TMP") or "/tmp").expanduser().resolve()
+TMP_DIR = _TMP_ROOT / "openclaw" / "revolut"
 
-DEFAULT_STATE_FILE = WORKSPACE_DIR / "revolut_state.json"
+CONFIG_DIR = WORKSPACE_DIR / "revolut"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+
+# ---- config ----
+
+def _load_config() -> dict:
+    """Load config.json from workspace/revolut/config.json."""
+    if CONFIG_FILE.exists():
+        try:
+            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _resolve_user(explicit_user: str | None) -> tuple[str | None, dict]:
+    """Resolve the active user and return (user_name, user_config).
+
+    Rules:
+    - If only one user in config: auto-select (no --user needed).
+    - If multiple users: --user is required.
+    - If no config/users: return (None, {}) for backward compat.
+    """
+    cfg = _load_config()
+    users = cfg.get("users", {})
+
+    if explicit_user:
+        if explicit_user not in users:
+            raise SystemExit(f"ERROR: user '{explicit_user}' not found in config. Available: {', '.join(users.keys())}")
+        return explicit_user, users[explicit_user]
+
+    if len(users) == 1:
+        name = next(iter(users))
+        return name, users[name]
+
+    if len(users) > 1:
+        raise SystemExit(f"ERROR: multiple users in config — use --user to select one: {', '.join(users.keys())}")
+
+    return None, {}
+
+
+# ---- path safety ----
+
+def _safe_output_path(raw: str) -> Path:
+    """Resolve *raw* and verify it lives under WORKSPACE_DIR or /tmp."""
+    p = Path(raw).expanduser().resolve()
+    ws = str(WORKSPACE_DIR)
+    tmp = str(Path("/tmp").resolve())
+    if not (str(p).startswith(ws + "/") or str(p) == ws
+            or str(p).startswith(tmp + "/") or str(p) == tmp):
+        raise SystemExit(f"ERROR: output path must be under workspace ({ws}) or /tmp, got: {p}")
+    return p
 
 
 def _profile_dir_from_args(args) -> Path:
-    val = getattr(args, "profile_dir", None)
-    if val:
-        return Path(val).expanduser().resolve()
-
-    # Default: a stable persistent profile alongside the state file.
-    # This keeps Revolut sessions stable across commands.
+    # Stable persistent profile alongside the state file.
     state = _state_file_from_args(args)
     base = state.parent
     name = f".pw-{state.stem}-profile"
@@ -280,14 +324,21 @@ def _require_playwright() -> None:
 
 # ------------------------- Revolut web (Playwright) -------------------------
 
+def _safe_filename_component(s: str) -> str:
+    """Sanitize a string for safe use in filenames (no path traversal)."""
+    s = re.sub(r'[^\w\-.]', '_', s.strip())
+    s = s.strip('._')
+    if not s or s in ('.', '..'):
+        raise SystemExit(f"ERROR: invalid user name: {s!r}")
+    return s
+
+
 def _state_file_from_args(args) -> Path:
-    val = getattr(args, "state", None)
-    if val:
-        return Path(val).expanduser().resolve()
-    env = os.environ.get("REVOLUT_STATE")
-    if env:
-        return Path(env).expanduser().resolve()
-    return DEFAULT_STATE_FILE
+    user_name = getattr(args, "_user_name", None) or getattr(args, "user", None)
+    if user_name:
+        safe = _safe_filename_component(user_name)
+        return CONFIG_DIR / f"state_{safe}.json"
+    return CONFIG_DIR / "state.json"
 
 
 def _looks_like_passcode_screen(text: str) -> bool:
@@ -742,24 +793,22 @@ def _resolve_account_selector(accounts: list[dict], selector: str) -> dict:
     return accounts[0] if accounts else {}
 
 
-def _handle_passcode_screen(page, passcode="060716"):
-    """Enter passcode if screen detected."""
+def _handle_passcode_screen(page, passcode: str | None = None):
+    """Enter passcode if screen detected.
+
+    Passcode is read from user config in config.json (or passed explicitly).
+    """
+    if not passcode:
+        return False
     try:
         if _looks_like_passcode_screen(page.inner_text("body")):
             print("[revolut] Passcode screen detected. Entering PIN...", file=sys.stderr)
-            # Find inputs. Usually 6 inputs or one hidden input?
-            # Based on research: input[aria-label="Code input 1"] ...
-            
-            # Try to find the first input
-            # HTML uses aria-label="Codeinput 1" (sometimes typo) or "Code input 1"
-            # Also inputmode="numeric" is a good target.
             inputs = page.locator('input[aria-label^="Code input"], input[aria-label^="Codeinput"], input[inputmode="numeric"], input[type="password"]')
             if inputs.count() > 0:
                 first = inputs.first
                 first.click()
                 time.sleep(0.5)
                 
-                # Type PIN
                 for digit in passcode:
                     page.keyboard.type(digit)
                     time.sleep(random.uniform(0.1, 0.3))
@@ -776,6 +825,42 @@ _LAST_AUTH_EXPIRED = False
 
 class RevolutAuthExpired(Exception):
     pass
+
+
+def _capture_qr_screenshot(page) -> Path | None:
+    """Try to screenshot just the QR code element, falling back to a cropped page screenshot."""
+    qr_path = TMP_DIR / "revolut_qr.png"
+    _ensure_dir(qr_path.parent)
+
+    # Strategy 1: Find the QR canvas/svg/img element and screenshot it directly
+    for selector in [
+        'canvas',                          # QR often rendered as <canvas>
+        'svg[viewBox]',                    # or as <svg>
+        '[data-testid*="qr"]',            # data-testid with "qr"
+        'img[src*="qr"]',                 # <img> with qr in src
+        '[class*="qr" i]',                # class containing "qr"
+        '[class*="QR"]',                  # class containing "QR"
+    ]:
+        try:
+            loc = page.locator(selector)
+            if loc.count() > 0:
+                el = loc.first
+                bbox = el.bounding_box()
+                if bbox and bbox["width"] > 50 and bbox["height"] > 50:
+                    el.screenshot(path=str(qr_path))
+                    print(f"[revolut] QR screenshot saved: {qr_path}", file=sys.stderr)
+                    return qr_path
+        except Exception:
+            continue
+
+    # Strategy 2: Full page screenshot (still useful for manual scanning)
+    try:
+        page.screenshot(path=str(qr_path))
+        print(f"[revolut] Full page screenshot saved (QR element not isolated): {qr_path}", file=sys.stderr)
+        return qr_path
+    except Exception as e:
+        print(f"[revolut] Failed to capture QR screenshot: {e}", file=sys.stderr)
+        return None
 
 
 def _try_extract_qr_url(page) -> str | None:
@@ -804,7 +889,7 @@ def _try_extract_qr_url(page) -> str | None:
     return None
 
 
-def _handle_auth_challenge(page, success_url_pattern="**/home**", auth_timeout_ms: int = 600_000):
+def _handle_auth_challenge(page, success_url_pattern="**/home**", auth_timeout_ms: int = 600_000, passcode: str | None = None):
     global _LAST_AUTH_EXPIRED
     _LAST_AUTH_EXPIRED = False
     """Handle PIN and/or QR code challenge if they appear.
@@ -831,7 +916,7 @@ def _handle_auth_challenge(page, success_url_pattern="**/home**", auth_timeout_m
         pass
 
     # 1) Passcode
-    if _handle_passcode_screen(page):
+    if _handle_passcode_screen(page, passcode=passcode):
         time.sleep(1)
 
     # If we're already where we need to be, we're done.
@@ -855,19 +940,17 @@ def _handle_auth_challenge(page, success_url_pattern="**/home**", auth_timeout_m
         if login_url:
             print("[revolut] Auth challenge detected (QR).", file=sys.stderr)
 
-            # IMPORTANT:
-            # - Moltbot's watcher/bridge typically detects ::TELEGRAM_PAYLOAD:: on STDOUT.
-            # - Use --out to write JSON to a file; keep STDOUT free for this prompt.
-            
+            # Capture QR code as image for scanning from another device
+            qr_path = _capture_qr_screenshot(page)
+
             print(f"IMPORTANT: Approve in Revolut app via this link: {login_url}")
-            print(f"::TELEGRAM_PAYLOAD::{login_url}")
+            if qr_path:
+                print(f"QR_IMAGE:{qr_path}")
+            print(f"[revolut] Approve in Revolut app via: {login_url}", file=sys.stderr)
             try:
                 sys.stdout.flush()
             except Exception:
                 pass
-
-            # Keep a trace in logs, but don't duplicate the payload line.
-            print(f"[revolut] IMPORTANT: Approve in Revolut app via: {login_url}", file=sys.stderr)
         else:
             # If we're already inside the Invest app (trade/activity/etc.), don't flag this as an auth challenge.
             # Only treat it as suspicious when we're on SSO/passcode flows.
@@ -955,7 +1038,7 @@ def cmd_login(args) -> int:
         except Exception:
             pass
 
-        ok = _handle_auth_challenge(page, success_url_pattern="**/home**")
+        ok = _handle_auth_challenge(page, success_url_pattern="**/home**", passcode=getattr(args, "_passcode", None))
         if not ok:
             if _LAST_AUTH_EXPIRED:
                 print("QR code expired, please try again", file=sys.stderr)
@@ -1021,7 +1104,7 @@ def cmd_accounts(args) -> int:
         # Check for passcode/QR if redirected to login
         try:
             page.goto(REVOLUT_HOME_URL, wait_until="domcontentloaded", timeout=15000)
-            ok = _handle_auth_challenge(page, success_url_pattern="**/home**")
+            ok = _handle_auth_challenge(page, success_url_pattern="**/home**", passcode=getattr(args, "_passcode", None))
             if not ok:
                 if _LAST_AUTH_EXPIRED:
                     print("QR code expired, please try again", file=sys.stderr)
@@ -1064,7 +1147,7 @@ def cmd_accounts(args) -> int:
         # We need to enter Invest context to access its APIs.
         try:
             page.goto(INVEST_HOME_URL, wait_until="domcontentloaded", timeout=15000)
-            ok = _handle_auth_challenge(page, success_url_pattern="**/trade/**")
+            ok = _handle_auth_challenge(page, success_url_pattern="**/trade/**", passcode=getattr(args, "_passcode", None))
             if not ok:
                 if _LAST_AUTH_EXPIRED:
                     print("QR code expired, please try again", file=sys.stderr)
@@ -1179,7 +1262,7 @@ def cmd_accounts(args) -> int:
 
         out_path = getattr(args, "out", None)
         if out_path:
-            Path(out_path).expanduser().resolve().write_text(
+            _safe_output_path(out_path).write_text(
                 json.dumps(wrapper, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
@@ -1339,7 +1422,7 @@ def cmd_transactions(args) -> int:
 
         try:
             page.goto(REVOLUT_HOME_URL, wait_until="domcontentloaded", timeout=30000)
-            _handle_auth_challenge(page, success_url_pattern="**/home**")
+            _handle_auth_challenge(page, success_url_pattern="**/home**", passcode=getattr(args, "_passcode", None))
             time.sleep(1)
         except Exception:
             pass
@@ -1464,7 +1547,7 @@ def cmd_transactions(args) -> int:
 
         out_path = getattr(args, "out", None)
         if out_path:
-            Path(out_path).expanduser().resolve().write_text(
+            _safe_output_path(out_path).write_text(
                 json.dumps(wrapper, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
@@ -1494,7 +1577,7 @@ def cmd_portfolio(args) -> int:
 
         try:
             page.goto(INVEST_HOME_URL, wait_until="domcontentloaded", timeout=15000)
-            ok = _handle_auth_challenge(page, success_url_pattern="**/portfolio**")
+            ok = _handle_auth_challenge(page, success_url_pattern="**/portfolio**", passcode=getattr(args, "_passcode", None))
             if not ok:
                 if _LAST_AUTH_EXPIRED:
                     print("QR code expired, please try again", file=sys.stderr)
@@ -1588,7 +1671,7 @@ def cmd_portfolio(args) -> int:
 
         out_path = getattr(args, "out", None)
         if out_path:
-            Path(out_path).expanduser().resolve().write_text(
+            _safe_output_path(out_path).write_text(
                 json.dumps(wrapper, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
@@ -1630,7 +1713,7 @@ def cmd_invest_scan(args) -> int:
 
         try:
             page.goto(INVEST_HOME_URL, wait_until="domcontentloaded", timeout=15000)
-            ok = _handle_auth_challenge(page, success_url_pattern="**/portfolio**")
+            ok = _handle_auth_challenge(page, success_url_pattern="**/portfolio**", passcode=getattr(args, "_passcode", None))
             if not ok:
                 if _LAST_AUTH_EXPIRED:
                     print("QR code expired, please try again", file=sys.stderr)
@@ -1667,7 +1750,7 @@ def cmd_invest_scan(args) -> int:
 
         out_path = getattr(args, "out", None)
         if out_path:
-            Path(out_path).expanduser().resolve().write_text(
+            _safe_output_path(out_path).write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
@@ -1715,7 +1798,7 @@ def cmd_invest_transactions(args) -> int:
         try:
             page.goto(INVEST_HOME_URL, wait_until="domcontentloaded", timeout=15000)
             # We consider ourselves authenticated once we're in the actual Invest trading UI.
-            ok = _handle_auth_challenge(page, success_url_pattern="**/trade/**")
+            ok = _handle_auth_challenge(page, success_url_pattern="**/trade/**", passcode=getattr(args, "_passcode", None))
             if not ok:
                 if _LAST_AUTH_EXPIRED:
                     print("QR code expired, please try again", file=sys.stderr)
@@ -1878,7 +1961,7 @@ def cmd_invest_transactions(args) -> int:
 
         out_path = getattr(args, "out", None)
         if out_path:
-            Path(out_path).expanduser().resolve().write_text(
+            _safe_output_path(out_path).write_text(
                 json.dumps(wrapper, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
@@ -1902,10 +1985,9 @@ def main() -> int:
 
     # Global flags
     parser.add_argument("--visible", action="store_true", help="Show browser window")
-    parser.add_argument("--state", default=None, help=f"Path to storage state (default: {DEFAULT_STATE_FILE})")
     parser.add_argument("--debug", action="store_true", help="Save raw Revolut payloads")
-    parser.add_argument("--out", default=None, help="Write JSON output to file (so STDOUT can be used for QR prompts)")
-    parser.add_argument("--profile-dir", default=None, help="Chromium user data dir for persistent sessions (default: alongside state file)")
+    parser.add_argument("--out", default=None, help="Write JSON output to file (must be under workspace or /tmp)")
+    parser.add_argument("--user", default=None, help="User profile name (uses revolut_state_{user}.json)")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1941,6 +2023,12 @@ def main() -> int:
     p_iscan.set_defaults(func=cmd_invest_scan)
 
     args = parser.parse_args()
+
+    # Resolve user early — attaches passcode to args for all commands
+    user_name, user_cfg = _resolve_user(args.user)
+    args._user_name = user_name
+    args._passcode = user_cfg.get("passcode")
+
     return int(args.func(args) or 0)
 
 
