@@ -37,3 +37,9 @@ If only one user is configured, `--user` can be omitted.
 - Playwright is required (`pip install playwright && playwright install chromium`).
 - QR code screenshot saved to `/tmp/openclaw/revolut/revolut_qr.png` during login.
 - See `SKILL.md` for agent usage guidance.
+
+## Documentation
+
+- [SKILL.md](SKILL.md) — agent-facing reference (commands, behavior, limitations)
+- [SETUP.md](SETUP.md) — prerequisites, configuration, and setup instructions
+- [ClawHub](https://www.clawhub.com/skills/revolut) — install via ClawHub registry
