@@ -1417,6 +1417,14 @@ def cmd_transactions(args) -> int:
             return 2
         from_date = datetime.strptime(date_from, "%Y-%m-%d").date()
         until_date = datetime.strptime(date_until, "%Y-%m-%d").date()
+        
+        # Clamp future dates to today to prevent Revolut API 400 Bad Request
+        today = datetime.now().date()
+        if until_date > today:
+            until_date = today
+            date_until = today.strftime("%Y-%m-%d")
+            print(f"[revolut] Clamped --until to today: {date_until}", file=sys.stderr)
+
         if from_date > until_date:
             print("[revolut] ERROR: --from must be on or before --until.", file=sys.stderr)
             return 2
@@ -1790,7 +1798,14 @@ def cmd_invest_transactions(args) -> int:
     import datetime
     try:
         datetime.datetime.strptime(date_from, "%Y-%m-%d")
-        datetime.datetime.strptime(date_until, "%Y-%m-%d")
+        
+        # Clamp future dates to today to prevent Revolut API 400 Bad Request
+        parsed_until = datetime.datetime.strptime(date_until, "%Y-%m-%d").date()
+        today = datetime.datetime.now().date()
+        if parsed_until > today:
+            date_until = today.strftime("%Y-%m-%d")
+            print(f"[revolut] Clamped --until to today: {date_until}", file=sys.stderr)
+            
     except ValueError:
         print("[revolut] ERROR: Dates must be in YYYY-MM-DD format.", file=sys.stderr)
         return 2
