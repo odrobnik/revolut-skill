@@ -2,7 +2,7 @@
 name: revolut
 description: "Revolut web automation via Playwright: login/logout, list accounts, and fetch transactions."
 summary: "Revolut banking automation: login, accounts, transactions, portfolio."
-version: 1.3.3
+version: 1.4.0
 homepage: "https://github.com/odrobnik/revolut-skill"
 metadata:
   openclaw:
@@ -61,6 +61,22 @@ python3 ~/Developer/Skills/banker/scripts/banker.py import --bank oliver@revolut
 # 5. Logout
 python3 {baseDir}/scripts/revolut.py --user oliver logout
 ```
+
+## Invest exports: what the rows mean (since 1.4.0)
+
+`invest-transactions` exports every completed item of the brokerage feed, not only trades:
+
+| kind | meaning | amount sign |
+|---|---|---|
+| `buy` / `sell` | securities trades (quantity, price, total incl. fees) | cash paid / received |
+| `cash_top_up` | money moved from a Revolut pocket into the brokerage account | + |
+| `withdrawal` | money moved out of the brokerage account | − |
+| `dividend` | net dividend credited to the brokerage cash (`gross` and `tax` kept alongside) | + |
+| other | any new feed type, exported with its raw type as `kind` | by side |
+
+Every row carries the feed item `id`, which banker uses for de-duplication. The brokerage cash balance can therefore be reconstructed as `top-ups − withdrawals − buys + sells + dividends`, and `portfolio` now also returns a `cash` list (one entry per currency, with `availableToInvest` and `unsettled`); `accounts` puts the main cash balance into the depot entry's `balances.booked`.
+
+Re-importing after the upgrade: older chunks have no ids, so banker would keep both copies of a trade. Export the whole depot history once (`--from` the depot's opening date), import it, and delete the older id-less chunks with `banker.py files` / `banker.py delete`.
 
 ## Recommended Flow
 
