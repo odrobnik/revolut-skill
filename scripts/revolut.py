@@ -1237,6 +1237,7 @@ def cmd_accounts(args) -> int:
 
             depot_currency = "USD"
             depot_value = None
+            canon_pf: dict = {}  # stays empty when no active GIA portfolio was found
             depot_pl = None
             depot_pct = None
 
