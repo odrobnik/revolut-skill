@@ -636,11 +636,16 @@ def canonicalize_revolut_portfolio(payload, tickers_by_ref: dict[str, dict] | No
     if not isinstance(holdings, list):
         holdings = []
 
+    cash: list[dict] = []
     for h in holdings:
         if not isinstance(h, dict):
             continue
         htype = h.get("assetType")
         if htype == "CASH":
+            bal = _extract_amount(h.get("balance") or h.get("total"))
+            if bal is not None:
+                cash.append({"currency": h.get("currency") or _extract_currency(h.get("balance")), "amount": bal,
+                             "availableToInvest": _extract_amount(h.get("availableToInvest")), "unsettled": _extract_amount(h.get("unsettled"))})
             continue
 
         symbol = h.get("symbol")
@@ -706,7 +711,7 @@ def canonicalize_revolut_portfolio(payload, tickers_by_ref: dict[str, dict] | No
 
         positions.append(pos)
 
-    return {"positions": positions}
+    return {"positions": positions, "cash": cash}
 
 def canonicalize_revolut_invest_tx(payload, name_map: dict | None = None) -> list[dict]:
     """Canonicalize Revolut Invest trade history into banker 'depot transactions' shape.
@@ -735,8 +740,13 @@ def canonicalize_revolut_invest_tx(payload, name_map: dict | None = None) -> lis
         if t.get("state") != "COMPLETED":
             continue
 
-        # We focus on TRADE (buy/sell securities)
-        if t.get("type") != "TRADE":
+        ttype = t.get("type")
+        if ttype != "TRADE":
+            # Cash movements of the brokerage account, dividends and anything new: keep them as cash rows
+            # so the account's cash balance can be reconstructed (issue #1).
+            cash_tx = _canonicalize_non_trade(t, name_map)
+            if cash_tx is not None:
+                out.append(cash_tx)
             continue
 
         symbol = t.get("symbol")
@@ -785,10 +795,59 @@ def canonicalize_revolut_invest_tx(payload, name_map: dict | None = None) -> lis
 
         # Also keep a convenient fallback field (some older code paths look at tx['isin']).
         tx["isin"] = (ref or symbol)
+        if t.get("id"):
+            tx["id"] = str(t["id"])
 
         out.append(tx)
 
     return out
+
+
+def _canonicalize_non_trade(t: dict, name_map: dict) -> dict | None:
+    """Non-trade items of the Revolut Invest feed as canonical cash rows.
+
+    CASH items are top-ups into (side BUY) or withdrawals from (side SELL) the brokerage account,
+    DIVIDENDS carry net/gross/tax. Unknown types are exported with their raw type as kind so they
+    never vanish silently. Amounts are signed from the brokerage account's point of view.
+    """
+    ttype = str(t.get("type") or "").upper()
+    side = str(t.get("side") or "").upper()
+    value = _extract_amount(t.get("value"))
+    cur = _extract_currency(t.get("value")) or _extract_currency(t.get("total")) or t.get("currency")
+    if value is None:
+        value = _extract_amount(t.get("total"))
+    if value is None:
+        return None
+    d = _to_date_iso(t.get("completedAt") or t.get("createdAt"))
+    symbol = t.get("symbol")
+    ref = t.get("ref")
+    if ttype == "CASH":
+        if side == "SELL":
+            kind, amount = "withdrawal", -abs(value)
+        else:
+            kind, amount = "cash_top_up", abs(value)
+        desc = t.get("localisedDescription") or f"{kind} {cur or ''}".strip()
+        tx = {"bookingDate": d, "status": "booked", "kind": kind, "amount": {"amount": amount, "currency": cur}, "description": desc}
+    elif ttype == "DIVIDENDS":
+        name = t.get("instrumentName") or (t.get("baseInstrument") or {}).get("name") or name_map.get(ref) or name_map.get(symbol) or symbol
+        tx = {"bookingDate": d, "status": "booked", "kind": "dividend", "security": {"isin": ref or symbol, "name": name}, "isin": ref or symbol,
+              "amount": {"amount": abs(value), "currency": cur}, "description": f"DIVIDEND {symbol}" if symbol else "DIVIDEND"}
+        gross, tax = _extract_amount(t.get("gross")), _extract_amount(t.get("tax"))
+        if gross is not None:
+            tx["gross"] = {"amount": gross, "currency": cur}
+        if tax is not None:
+            tx["tax"] = {"amount": tax, "currency": cur}
+    else:
+        sign = -1 if side == "SELL" or ttype in ("FEE", "FEES", "WITHDRAWAL") else 1
+        tx = {"bookingDate": d, "status": "booked", "kind": ttype.lower(), "amount": {"amount": sign * abs(value), "currency": cur},
+              "description": t.get("localisedDescription") or f"{ttype} {symbol or ''}".strip()}
+        if symbol or ref:
+            tx["security"] = {"isin": ref or symbol, "name": name_map.get(ref) or name_map.get(symbol) or symbol}
+            tx["isin"] = ref or symbol
+    tx["venue"] = "REVOLUT"
+    if t.get("id"):
+        tx["id"] = str(t["id"])
+    return tx
 
 
 def _resolve_account_selector(accounts: list[dict], selector: str) -> dict:
@@ -1254,6 +1313,13 @@ def cmd_accounts(args) -> int:
                     "profitLoss": {"amount": depot_pl, "currency": depot_currency, "percent": depot_pct},
                 }
 
+            # Uninvested cash held inside the brokerage account (issue #1)
+            cash_rows = canon_pf.get("cash") or []
+            cash_main = next((c for c in cash_rows if c.get("currency") == depot_currency), None) or (cash_rows[0] if cash_rows else None)
+            if cash_main and cash_main.get("amount") is not None:
+                depot_acct["balances"] = {"booked": {"amount": cash_main["amount"], "currency": cash_main.get("currency") or depot_currency},
+                                          "available": {"amount": cash_main.get("availableToInvest", cash_main["amount"]), "currency": cash_main.get("currency") or depot_currency}}
+                depot_acct["cash"] = cash_rows
             # Replace existing synthetic depot entry if present
             accounts = [a for a in accounts if a.get("id") != depot_account_id]
             accounts.append(depot_acct)
@@ -1938,7 +2004,7 @@ def cmd_invest_transactions(args) -> int:
             txs = canonicalize_revolut_invest_tx(raw, name_map=name_map)
             # de-dupe overlapping pages
             for tx in txs:
-                key = (
+                key = ("id", tx["id"]) if tx.get("id") else (
                     tx.get("bookingDate"),
                     tx.get("kind"),
                     (tx.get("security") or {}).get("isin"),
