@@ -2142,7 +2142,8 @@ def cmd_invest_statements(args) -> int:
     fmt = args.format.upper()
 
     out_dir = _safe_output_path(args.dir) if getattr(args, "dir", None) else TMP_DIR / "statements"
-    _ensure_dir(out_dir)
+    # Statements hold holdings, transactions and the postal address: keep them owner-only.
+    out_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     user_part = _safe_filename_component(getattr(args, "_user_name", None) or "revolut")
 
     with sync_playwright() as p:
@@ -2196,7 +2197,10 @@ def cmd_invest_statements(args) -> int:
                 continue
 
             path = out_dir / f"revolut_{user_part}_{stem}_{d_from.isoformat()}_{d_until.isoformat()}.{ext}"
-            path.write_bytes(resp.body())
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(resp.body())
+            os.chmod(path, 0o600)  # also tighten a file left over from an earlier run
             print(f"[revolut] Saved {kind} statement: {path}", file=sys.stderr)
             files.append({"kind": kind, "format": ext, "path": str(path)})
 
