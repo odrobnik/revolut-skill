@@ -1,6 +1,6 @@
 # Revolut Skill
 
-Unified web automation for Revolut: login, logout, accounts, transactions, portfolio.
+Unified web automation for Revolut: login, logout, accounts, transactions, portfolio, Invest statements.
 
 ## Setup
 
@@ -21,6 +21,7 @@ python3 scripts/revolut.py --user oliver login
 python3 scripts/revolut.py --user oliver accounts
 python3 scripts/revolut.py --user oliver transactions --from 2025-01-01 --until 2026-01-31
 python3 scripts/revolut.py --user sylvia portfolio
+python3 scripts/revolut.py --user oliver invest-statements --year 2025
 ```
 
 If only one user is configured, `--user` can be omitted.
