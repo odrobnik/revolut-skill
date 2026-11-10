@@ -1227,14 +1227,7 @@ def cmd_accounts(args) -> int:
             invest_headers = _get_api_headers(page)
 
             # Determine portfolio id if not provided.
-            pid = portfolio_id
-            if not pid:
-                raw_list = _fetch_via_api_call(page, "/api/retail/trading-access/portfolios", invest_headers)
-                if isinstance(raw_list, list):
-                    for p0 in raw_list:
-                        if isinstance(p0, dict) and p0.get("state") == "ACTIVE" and p0.get("accountType") == "GIA":
-                            pid = p0.get("id")
-                            break
+            pid = portfolio_id or _pick_portfolio_id(page, invest_headers)
 
             depot_currency = "USD"
             depot_value = None
@@ -1687,6 +1680,7 @@ def cmd_portfolio(args) -> int:
 
         # If caller provided a portfolio id, fetch that directly.
         raw = None
+        portfolio_id = portfolio_id or _pick_portfolio_id(page, headers)
         if portfolio_id:
             raw = _fetch_via_api_call(page, f"/api/retail/trading-access/portfolios/{portfolio_id}", headers)
 
